@@ -25,5 +25,10 @@ if command -v wasm-opt >/dev/null && [ "$variant" = release ]; then
 fi
 
 printf "GitHub Pages: skip Jekyll processing.\n" > dist/.nojekyll
+# Turn wasm-opt miscompilations into a failed build instead of a broken page.
+if command -v node >/dev/null; then
+  node dev/check-wasm.mjs dist/pkg/pigeons_web_bg.wasm
+fi
+
 cp web/index.html web/style.css dist/
 printf 'built dist/ (%s)\n' "$(du -sh dist | cut -f1)"

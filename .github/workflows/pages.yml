@@ -47,11 +47,17 @@ jobs:
         run: cargo install wasm-bindgen-cli --version 0.2.122 --locked
 
       # Optional, but it halves the download: build.sh uses wasm-opt when present.
+      # Pinned because Ubuntu's binaryen (116) miscompiles this module: it retargets
+      # the __wbindgen_externrefs export to the funcref table and the page dies at
+      # startup with "failed to grow table". dev/check-wasm.mjs guards the build.
       - name: install binaryen
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends binaryen
-          wasm-opt --version
+          version=126
+          curl -sSL -o /tmp/binaryen.tar.gz \
+            "https://github.com/WebAssembly/binaryen/releases/download/version_${version}/binaryen-version_${version}-x86_64-linux.tar.gz"
+          tar -xzf /tmp/binaryen.tar.gz -C "$HOME"
+          echo "$HOME/binaryen-version_${version}/bin" >> "$GITHUB_PATH"
+          "$HOME/binaryen-version_${version}/bin/wasm-opt" --version
 
       - name: build
         run: ./build.sh release

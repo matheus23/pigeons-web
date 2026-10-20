@@ -1,0 +1,6 @@
+# wasm-ld sizes the function table to exactly the functions it can see, which
+# leaves no room for wasm-bindgen to add entries at runtime: the page then dies
+# at startup with "failed to grow table". Asking the linker for a growable table
+# removes the maximum, so runtime growth works whatever the optimizer does.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--growable-table"]

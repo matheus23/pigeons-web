@@ -128,6 +128,11 @@ every asset path is relative, so the subpath needs no configuration, and the
 `.wasm` type does not matter because the loader falls back when the server does
 not send `application/wasm`.
 
+The workflow pins binaryen 126 because Ubuntu's 116 miscompiles this module, and
+`build.sh` runs `dev/check-wasm.mjs`, which fails the build unless the module's
+`__wbindgen_externrefs` export is a growable externref table — the thing the
+browser grows at startup.
+
 The published page is the only thing to share — there is no service to run
 alongside it. If you attach a custom domain, use that address in docs and
 elsewhere: it is the link to the live page.

@@ -1,0 +1,499 @@
+:root {
+  color-scheme: dark;
+  --bg: #07090e;
+  --panel: #0c1017;
+  --panel-raised: #11161f;
+  --line: #1b2230;
+  --line-soft: #151b26;
+  --text: #cfd6e4;
+  --dim: #76819a;
+  --accent: #79b8ff;
+  --danger: #ff7b72;
+  --radius: 12px;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+}
+
+/* ------------------------------------------------------------------ topbar */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  height: 52px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--line-soft);
+  background: linear-gradient(180deg, #0b0f16, #080b11);
+  flex: none;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 13px;
+  letter-spacing: 0.01em;
+  color: #e7ecf6;
+}
+
+.mark {
+  font-size: 15px;
+  filter: saturate(0.9);
+}
+
+.wordmark .dot {
+  color: var(--accent);
+}
+
+.pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  padding: 5px 6px 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.pill .dot-indicator {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+
+  background: #39435a;
+}
+
+.pill.connected {
+  color: var(--text);
+  border-color: #24405c;
+  background: #0d1620;
+}
+
+.pill.connected .dot-indicator {
+  background: #5cc98a;
+  box-shadow: 0 0 0 3px rgb(92 201 138 / 12%);
+}
+
+.pill-close {
+  display: none;
+  border: 0;
+  background: none;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 4px;
+  border-radius: 6px;
+}
+
+.pill.connected .pill-close {
+  display: inline;
+}
+
+.pill-close:hover {
+  color: var(--text);
+  background: #17202e;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+button {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--panel-raised);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 11px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+button:hover {
+  background: #161d29;
+  border-color: #26303f;
+}
+
+button.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--dim);
+}
+
+button.ghost:hover {
+  color: var(--text);
+  background: #121826;
+  border-color: var(--line);
+}
+
+button.danger {
+  color: var(--danger);
+  border-color: #3a1f22;
+  background: #1a1114;
+}
+
+button.danger:hover {
+  background: #23151a;
+  border-color: #4d272c;
+}
+
+button.icon {
+  background: transparent;
+  border-color: transparent;
+  color: var(--dim);
+  font-size: 11px;
+  padding: 4px 6px;
+}
+
+button.icon:hover {
+  color: var(--danger);
+  background: #1a1114;
+}
+
+button.wide {
+  width: 100%;
+  margin-top: 8px;
+  border: 1px dashed var(--line);
+  background: transparent;
+  color: var(--dim);
+}
+
+/* ---------------------------------------------------------------- terminal */
+
+.terminal {
+  flex: 1;
+  min-height: 0;
+  padding: 14px 16px 10px;
+}
+
+.viewport {
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+}
+
+.grid {
+  --cell-w: 8.4px;
+  --cell-h: 18px;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: var(--cell-h);
+  color: var(--text);
+}
+
+.probe {
+  position: absolute;
+  visibility: hidden;
+  white-space: pre;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: var(--cell-h);
+}
+
+.row {
+  height: var(--cell-h);
+  line-height: var(--cell-h);
+  white-space: pre;
+  width: 100%;
+  overflow: hidden;
+}
+
+.cursor {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: var(--cell-w);
+  height: var(--cell-h);
+  background: var(--accent);
+  opacity: 0.55;
+  pointer-events: none;
+  animation: blink 1.15s steps(1, end) infinite;
+}
+
+@keyframes blink {
+  0%,
+  55% {
+    opacity: 0.55;
+  }
+  56%,
+  100% {
+    opacity: 0;
+  }
+}
+
+/* --------------------------------------------------------------- statusbar */
+
+.statusbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: 30px;
+  padding: 0 16px;
+  border-top: 1px solid var(--line-soft);
+  color: #4d5771;
+  font-size: 11px;
+  flex: none;
+}
+
+.statusbar .signature {
+  color: #39425a;
+}
+
+/* ------------------------------------------------------------------ modal */
+
+.modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgb(4 6 10 / 66%);
+  backdrop-filter: blur(7px);
+  z-index: 20;
+}
+
+.modal.open {
+  display: grid;
+  place-items: center;
+}
+
+.sheet {
+  width: min(760px, 94vw);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  box-shadow: 0 30px 80px rgb(0 0 0 / 55%);
+  overflow: hidden;
+}
+
+.sheet-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 20px 22px 16px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.sheet-header h1 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+.sheet-header p {
+  margin: 5px 0 0;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.sheet-body {
+  padding: 18px 22px 24px;
+  overflow: auto;
+}
+
+.section-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 18px 0 10px;
+}
+
+.section-title:first-child {
+  margin-top: 0;
+}
+
+.section-title h2 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.section-title .sub {
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.host-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 2.4fr auto;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.field {
+  width: 100%;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  background: #0a0e15;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.field::placeholder {
+  color: #414b62;
+}
+
+.field:focus {
+  border-color: #2b4666;
+  box-shadow: 0 0 0 3px rgb(121 184 255 / 10%);
+}
+
+.identity {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  background: #0a0e15;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.identity .meta {
+  font-size: 11px;
+  color: var(--dim);
+  letter-spacing: 0.02em;
+}
+
+.pubkey {
+  display: block;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #a9b6cd;
+  word-break: break-all;
+}
+
+.row-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.note {
+  margin: 14px 0 0;
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--dim);
+}
+
+/* ------------------------------------------------------------------ toast */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 46px;
+  transform: translate(-50%, 8px);
+  padding: 7px 14px;
+  border-radius: 999px;
+  background: #141b26;
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 12px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+.toast.visible {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+.boot-error {
+  display: none;
+  position: fixed;
+  inset: auto 16px 16px;
+  padding: 12px 14px;
+  background: #1d1013;
+  border: 1px solid #40222a;
+  border-radius: 10px;
+  color: #ffb4ae;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.boot-error.visible {
+  display: block;
+}
+
+@media (max-width: 700px) {
+  .host-row {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .wordmark {
+    display: none;
+  }
+}
+
+/* Host rows must be able to shrink: text fields default to a wide intrinsic
+   width, which pushes the remove button out of the sheet. */
+.host-row > * {
+  min-width: 0;
+}
+
+.sheet-body::-webkit-scrollbar {
+  width: 10px;
+}
+
+.sheet-body::-webkit-scrollbar-thumb {
+  background: #1d2432;
+  border-radius: 999px;
+  border: 3px solid var(--panel);
+}
+
+.sheet-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* At narrow widths each host wraps to two lines, so separate the blocks or the
+   remove button reads as belonging to the next host. */
+@media (max-width: 700px) {
+  .host-row {
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+
+  .host-row:last-of-type {
+    border-bottom: 0;
+  }
+}

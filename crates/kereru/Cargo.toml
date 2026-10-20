@@ -1,0 +1,29 @@
+[package]
+name = "kereru"
+description = "A small SSH client that runs in the browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aes-gcm = "0.10"
+async-trait = "0.1"
+base64 = "0.22"
+chacha20 = "0.9"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+poly1305 = "0.8"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["io-util", "sync", "macros"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[dev-dependencies]
+getrandom = "0.2"
+base64 = "0.22"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt", "net", "io-util", "io-std", "time"] }

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>pigeons.computer</title>
+    <meta name="description" content="ssh in your browser, carried over iroh" />
+    <meta name="color-scheme" content="dark" />
+    <link rel="stylesheet" href="style.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%95%8A%3C/text%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="mark" aria-hidden="true">🕊</span>
+          <span class="wordmark">pigeons<span class="dot">.</span>computer</span>
+        </div>
+
+        <div class="pill" id="session-pill">
+          <span class="dot-indicator" aria-hidden="true"></span>
+          <span id="session-name">local</span>
+          <button id="session-close" class="pill-close" title="disconnect (Ctrl+Shift+D)">
+            ✕
+          </button>
+        </div>
+
+        <div class="actions">
+          <button id="btn-key" class="ghost">identity</button>
+          <button id="btn-settings" class="ghost">settings</button>
+        </div>
+      </header>
+
+      <main class="terminal" id="terminal">
+        <div class="viewport" id="viewport">
+          <div class="grid" id="grid">
+            <span id="probe" class="probe">MMMMMMMMMMMMMMMMMMMM</span>
+          </div>
+          <div class="cursor" id="cursor"></div>
+        </div>
+      </main>
+
+      <footer class="statusbar">
+        <span id="hint">ssh &lt;host&gt; to connect</span>
+        <span class="signature">wasm · webcrypto · iroh</span>
+      </footer>
+    </div>
+
+    <div class="modal" id="settings" role="dialog" aria-modal="true" aria-label="settings">
+      <div class="sheet">
+        <header class="sheet-header">
+          <div>
+            <h1>settings</h1>
+            <p>Everything here stays in this browser.</p>
+          </div>
+          <button class="ghost" id="settings-close">done</button>
+        </header>
+        <div class="sheet-body" id="settings-body"></div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+    <div class="boot-error" id="boot-error"></div>
+
+    <script type="module">
+      import init from "./pkg/pigeons_web.js";
+      init().catch((error) => {
+        const node = document.getElementById("boot-error");
+        node.className = "boot-error visible";
+        node.textContent = `could not start: ${error}`;
+      });
+    </script>
+  </body>
+</html>

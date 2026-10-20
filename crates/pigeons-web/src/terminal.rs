@@ -160,7 +160,7 @@ impl Terminal {
         let (rows, columns) = screen.size();
 
         for row in 0..rows as usize {
-            let (signature, runs) = row_runs(screen, row as u16, columns);
+            let (signature, runs) = row_runs(screen, row as u16, columns, self.cell_w);
             if self.painted.get(row) == Some(&signature) {
                 continue;
             }
@@ -168,15 +168,15 @@ impl Terminal {
                 while let Some(child) = element.first_child() {
                     element.remove_child(&child).ok();
                 }
-                for (style, text) in runs {
+                for run in runs {
                     let span: HtmlElement = platform::document()
                         .create_element("span")
                         .expect("span")
                         .unchecked_into();
-                    if !style.is_empty() {
-                        span.set_attribute("style", &style).ok();
+                    if !run.css.is_empty() {
+                        span.set_attribute("style", &run.css).ok();
                     }
-                    span.set_text_content(Some(&text));
+                    span.set_text_content(Some(&run.text));
                     element.append_child(&span).ok();
                 }
                 if self.painted.len() <= row {
@@ -238,9 +238,22 @@ impl Terminal {
 }
 
 /// Builds one row's style runs plus a signature for change detection.
-fn row_runs(screen: &vt100::Screen, row: u16, columns: u16) -> (String, Vec<(String, String)>) {
+/// One painted stretch of a row.
+struct Run {
+    css: String,
+    text: String,
+}
+
+/// Builds one row's runs plus a signature for change detection.
+///
+/// Wide glyphs (CJK, emoji) get their own fixed-width box. Left to itself, the
+/// text engine lays a fallback CJK glyph out at one em instead of two cells
+/// (13px against a 15.6px cell here), so a line containing them drifts left by
+/// ~2.6px per glyph and nothing below it lines up. Pinning the advance to two
+/// cells keeps the grid intact whatever font the system picks.
+fn row_runs(screen: &vt100::Screen, row: u16, columns: u16, cell_width: f64) -> (String, Vec<Run>) {
     let mut signature = String::with_capacity(columns as usize * 4);
-    let mut runs: Vec<(String, String)> = Vec::new();
+    let mut runs: Vec<Run> = Vec::new();
 
     for column in 0..columns {
         let Some(cell) = screen.cell(row, column) else {
@@ -255,17 +268,37 @@ fn row_runs(screen: &vt100::Screen, row: u16, columns: u16) -> (String, Vec<(Str
         } else {
             " ".to_owned()
         };
+
+        // Any non-ASCII glyph can be laid out at a width that disagrees with the
+        // cell model: a CJK ideograph comes out at one em (1.67 cells here) and
+        // an emoji that the emulator counts as one column can be drawn two cells
+        // wide. Boxing them makes the advance exact, whatever the font does;
+        // ASCII runs stay merged so ordinary output is unaffected.
+        let exotic = match text.chars().collect::<Vec<_>>().as_slice() {
+            [single] => !single.is_ascii(),
+            _ => false,
+        };
+        if exotic {
+            let cells = if cell.is_wide() { 2.0 } else { 1.0 };
+            let width = cell_width * cells;
+            runs.push(Run {
+                css: format!("{style}display:inline-block;width:{width}px;text-align:center;"),
+                text,
+            });
+            continue;
+        }
+
         match runs.last_mut() {
-            Some((last_style, last_text)) if *last_style == style => last_text.push_str(&text),
-            _ => runs.push((style, text)),
+            Some(last) if last.css == style => last.text.push_str(&text),
+            _ => runs.push(Run { css: style, text }),
         }
     }
 
-    for (style, text) in &runs {
+    for run in &runs {
         signature.push('\x1f');
-        signature.push_str(style);
+        signature.push_str(&run.css);
         signature.push('\x1e');
-        signature.push_str(text);
+        signature.push_str(&run.text);
     }
     (signature, runs)
 }

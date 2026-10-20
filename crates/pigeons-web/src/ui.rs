@@ -43,6 +43,7 @@ pub async fn run() -> Result<()> {
         history: Vec::new(),
         history_position: None,
         busy: false,
+        connect_generation: 0,
     }));
 
     app.borrow_mut().self_ref = Rc::downgrade(&app);
@@ -77,6 +78,8 @@ struct App {
     history: Vec<String>,
     history_position: Option<usize>,
     busy: bool,
+    /// Bumped when a connection attempt starts or ends, so a stale spinner stop s.
+    connect_generation: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +161,9 @@ impl App {
             return None;
         }
 
+        // A dial is in flight: the prompt is gone, so swallow typing rather than
+        // printing characters over the spinner line. The shortcuts below still
+        // work, so a stuck attempt can always be cancelled.
         let ctrl = event.ctrl_key() || event.meta_key();
         if ctrl && event.shift_key() {
             match event.key().to_ascii_lowercase().as_str() {
@@ -187,7 +193,11 @@ impl App {
                 "b" => {
                     event.prevent_default();
                     let (columns, rows) = self.term.size();
-                    let dump = format!("# {columns}x{rows}\n{}\n", self.term.received_dump());
+                    let (cursor_row, cursor_column) = self.term.cursor_cell();
+                    let dump = format!(
+                        "# {columns}x{rows} cursor=({cursor_row},{cursor_column})\n{}\n",
+                        self.term.received_dump()
+                    );
                     platform::log(&dump);
                     wasm_bindgen_futures::spawn_local(async move {
                         let _ = platform::copy_text(&dump).await;
@@ -197,6 +207,13 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        // A dial is in flight: there is no prompt, so swallow typing rather than
+        // printing characters over the spinner line.
+        if self.busy {
+            event.prevent_default();
+            return None;
         }
 
         if self.session.is_some() {
@@ -424,7 +441,9 @@ impl App {
                 .term
                 .write(&format!("{other}: no such command. try `help`.\n")),
         }
-        if self.session.is_none() {
+        // While a connection is being set up there is no prompt: the command has
+        // not finished, and printing one made the page look idle.
+        if self.session.is_none() && !self.busy {
             self.prompt();
         }
         None
@@ -589,13 +608,17 @@ impl App {
 
         self.busy = true;
         self.term.write(&format!(
-            "{DIM}connecting to {} over iroh ({target}){RESET}\n",
-            host.name
+            "{DIM}connecting to {} · roost {}{RESET}\n",
+            host.name,
+            shorten(&target, 24)
         ));
+        self.connect_generation = self.connect_generation.wrapping_add(1);
+        let generation = self.connect_generation;
         render_chrome(None, true);
         let Some(app) = self.self_ref.upgrade() else {
             return;
         };
+        spawn_spinner(app.clone(), generation);
         wasm_bindgen_futures::spawn_local(async move {
             connect(app, host, user, command, target).await;
         });
@@ -603,9 +626,15 @@ impl App {
 
     fn end_session(&mut self, message: Option<String>) {
         let label = self.session.as_ref().map(|session| session.label.clone());
+        let was_connecting = self.busy;
         self.session = None;
         self.busy = false;
+        self.connect_generation = self.connect_generation.wrapping_add(1);
         self.term.set_crlf(false);
+        // Take the spinner line back before printing the outcome on it.
+        if was_connecting {
+            self.term.write("\r\x1b[K");
+        }
         match (label, message) {
             (Some(label), Some(error)) => {
                 self.term
@@ -693,8 +722,9 @@ async fn connect(
 
         Err(error) => {
             {
+                // `end_session` clears the busy flag itself and takes the
+                // spinner line back before printing the failure on it.
                 let mut state = app.borrow_mut();
-                state.busy = false;
                 state.end_session(Some(error));
             }
             update_chrome(&app);
@@ -1114,4 +1144,33 @@ fn normalized_target(raw: &str) -> Option<String> {
         return None;
     }
     Some(id.to_owned())
+}
+
+/// Spins a status line while a connection is being set up.
+///
+/// The dial can take up to iroh's connect timeout, so the terminal has to show
+/// that something is happening; the loop stops as soon as the attempt ends,
+/// which the generation counter signals.
+fn spawn_spinner(app: Rc<RefCell<App>>, generation: u32) {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+    wasm_bindgen_futures::spawn_local(async move {
+        let mut frame = 0;
+        loop {
+            {
+                let mut state = app.borrow_mut();
+                if !state.busy || state.connect_generation != generation {
+                    break;
+                }
+                let glyph = FRAMES[frame % FRAMES.len()];
+                state
+                    .term
+                    .write(&format!("\r\x1b[K{DIM}{glyph} dialing the roost…{RESET}"));
+            }
+            frame += 1;
+            wasm_bindgen_futures::JsFuture::from(platform::sleep(120))
+                .await
+                .ok();
+        }
+    });
 }

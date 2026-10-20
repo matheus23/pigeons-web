@@ -521,3 +521,10 @@ fn normalise_newlines(bytes: &[u8]) -> Vec<u8> {
     }
     out
 }
+
+impl Terminal {
+    /// The cursor cell the emulator currently reports, for diagnostics.
+    pub fn cursor_cell(&self) -> (u16, u16) {
+        self.parser.screen().cursor_position()
+    }
+}

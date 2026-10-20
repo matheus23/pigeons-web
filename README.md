@@ -1,4 +1,4 @@
-# pigeons.computer
+# pigeons-web
 
 SSH in your browser, carried over [iroh](https://iroh.computer). One static page,
 no backend, no plugin.
@@ -31,7 +31,7 @@ helper process in between and nothing to deploy next to the static files.
 | crate | what it is |
 | --- | --- |
 | `crates/kereru` | A small SSH client. Pure Rust, no I/O assumptions, compiles to wasm. |
-| `crates/web` | The browser app: terminal, identity, host config, iroh tunnel. |
+| `crates/pigeons-web` | The browser app: terminal, identity, host config, iroh tunnel. |
 
 ### `kereru` — the SSH client
 
@@ -70,7 +70,7 @@ It runs over any `tokio::io::{AsyncRead, AsyncWrite}`, which is why the same cod
 is tested natively against a real `sshd` and used in the browser over an iroh
 stream.
 
-### `crates/web` — the page
+### `crates/pigeons-web` — the page
 
 - **Tunnel**: one iroh endpoint per page (`tunnel.rs`). The first connection binds
   it; later ones reuse it. The roost's stream is adapted to `AsyncRead`/
@@ -118,6 +118,19 @@ Open <http://localhost:8787>, then:
 
 `dist/` is a plain static directory, deployable anywhere. It has to be served
 over HTTPS or from `localhost`: WebCrypto only exists in a secure context.
+
+### Publishing
+
+`.github/workflows/pages.yml` builds `dist/` and deploys it to GitHub Pages on
+every push to `main`. Enable it once under *Settings → Pages → Source → GitHub
+Actions*. A project page is served from `https://<owner>.github.io/pigeons-web/`;
+every asset path is relative, so the subpath needs no configuration, and the
+`.wasm` type does not matter because the loader falls back when the server does
+not send `application/wasm`.
+
+The published page is the only thing to share — there is no service to run
+alongside it. If you attach a custom domain, use that address in docs and
+elsewhere: it is the link to the live page.
 
 ## Tests
 

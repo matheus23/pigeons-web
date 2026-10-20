@@ -222,9 +222,9 @@ impl Terminal {
         let title = screen.title().to_owned();
         if title != self.title {
             let label = if title.is_empty() {
-                "pigeons.computer".to_owned()
+                "pigeons-web".to_owned()
             } else {
-                format!("{title} — pigeons.computer")
+                format!("{title} — pigeons-web")
             };
             self.title = title;
             platform::document().set_title(&label);

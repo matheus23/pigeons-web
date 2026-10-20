@@ -326,7 +326,7 @@ impl App {
         let key = shorten(&key, 44);
 
         self.term.write(&format!(
-            "{ACCENT}pigeons.computer{RESET}\n\
+            "{ACCENT}pigeons-web{RESET}\n\
              {DIM}ssh in your browser, carried over iroh{RESET}\n\n\
              {DIM}hosts {RESET} {hosts}\n\
              {DIM}key   {RESET} {key}\n\n\
@@ -431,8 +431,7 @@ impl App {
              {ACCENT}forget <host>{RESET}\n\
              {DIM}  drop the remembered host key after a legitimate server change{RESET}\n\
              {ACCENT}settings{RESET}\n\
-             {DIM}  hosts, identity, this browser's roost id{RESET}
-\
+             {DIM}  hosts, identity, this browser's endpoint id{RESET}\n\
              {ACCENT}disconnect{RESET}\n\
              {DIM}  or Ctrl+Shift+D, and Ctrl+Shift+C copies the screen{RESET}\n"
         ));
@@ -829,7 +828,7 @@ fn render_settings(app: &Rc<RefCell<App>>) {
         let row = platform::element("div", "host-row");
 
         let name = text_field("name", &host.name, "name");
-        let user = text_field("user", &host.user, "user (optional)");
+        let user = text_field("user", &host.user, "user");
         let target = text_field("target", &host.target, "roost endpoint id");
 
         // Rows are addressed by position: a row can be renamed while the sheet

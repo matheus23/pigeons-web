@@ -1,0 +1,71 @@
+name: pages
+
+# Builds the wasm page and publishes dist/ to GitHub Pages.
+#
+# The page is entirely static and self-contained: no server, no secrets, and no
+# backend. Set Settings -> Pages -> Source to "GitHub Actions" once.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel and the wasm target.
+      - name: install rust
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+          rustc --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Must match the wasm-bindgen version pinned in crates/web/Cargo.toml.
+      - name: install wasm-bindgen
+        run: cargo install wasm-bindgen-cli --version 0.2.122 --locked
+
+      # Optional, but it halves the download: build.sh uses wasm-opt when present.
+      - name: install binaryen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binaryen
+          wasm-opt --version
+
+      - name: build
+        run: ./build.sh release
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

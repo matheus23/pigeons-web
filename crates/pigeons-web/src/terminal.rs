@@ -31,6 +31,9 @@ pub struct Terminal {
     cursor_visible: bool,
     /// Tail of what the remote sent, for the byte dump.
     received: std::collections::VecDeque<u8>,
+    /// Trailing partial escape sequence, held back for the next chunk so a
+    /// sequence split across reads is still recognised as one.
+    pending_prefix: Vec<u8>,
     /// Translate bare LF to CRLF. A session without a pseudo-terminal delivers
     /// plain newlines; a real terminal's line discipline would add the CR, and
     /// without it every line starts where the previous one ended.
@@ -52,6 +55,7 @@ impl Terminal {
             title: String::new(),
             cursor_visible: true,
             received: std::collections::VecDeque::new(),
+            pending_prefix: Vec::new(),
             crlf: false,
         };
         terminal.fit();
@@ -144,11 +148,22 @@ impl Terminal {
         while self.received.len() > 8192 {
             self.received.pop_front();
         }
+
+        // Reassemble the stream, keeping any partial escape prefix for the next
+        // chunk so a sequence split across reads is still recognised.
+        let mut data = std::mem::take(&mut self.pending_prefix);
+        data.extend_from_slice(bytes);
+        let tail = escape_prefix_len(&data);
+        if tail > 0 {
+            self.pending_prefix = data.split_off(data.len() - tail);
+        }
+
+        let data = rewrite_save_restore(&data);
         if self.crlf {
-            let fixed = normalise_newlines(bytes);
+            let fixed = normalise_newlines(&data);
             self.parser.process(&fixed);
         } else {
-            self.parser.process(bytes);
+            self.parser.process(&data);
         }
         self.render();
     }
@@ -526,5 +541,70 @@ impl Terminal {
     /// The cursor cell the emulator currently reports, for diagnostics.
     pub fn cursor_cell(&self) -> (u16, u16) {
         self.parser.screen().cursor_position()
+    }
+}
+
+/// Length of a trailing, incomplete escape prefix (`ESC` or `ESC [`).
+fn escape_prefix_len(data: &[u8]) -> usize {
+    match data {
+        [.., 0x1b] => 1,
+        [.., 0x1b, b'['] => 2,
+        _ => 0,
+    }
+}
+
+/// Rewrites `CSI s` / `CSI u` into `DECSC` / `DECRC`.
+///
+/// Both spellings mean "save cursor" / "restore cursor" in xterm, and prompts
+/// that draw a right-hand segment rely on it. The emulator implements only the
+/// ESC 7 / ESC 8 form, so the xterm spelling is silently ignored: the cursor is
+/// left wherever the segment ended instead of being restored, which then puts
+/// the prompt and the cursor on the wrong cells.
+fn rewrite_save_restore(data: &[u8]) -> Vec<u8> {
+    if !data.windows(3).any(|w| w == b"\x1b[s" || w == b"\x1b[u") {
+        return data.to_vec();
+    }
+    let mut out = Vec::with_capacity(data.len());
+    let mut index = 0;
+    while index < data.len() {
+        if data.len() - index >= 3
+            && data[index] == 0x1b
+            && data[index + 1] == b'['
+            && (data[index + 2] == b's' || data[index + 2] == b'u')
+        {
+            out.push(0x1b);
+            out.push(if data[index + 2] == b's' { b'7' } else { b'8' });
+            index += 3;
+        } else {
+            out.push(data[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{escape_prefix_len, rewrite_save_restore};
+
+    #[test]
+    fn save_restore_is_rewritten_to_decsc_decrc() {
+        assert_eq!(rewrite_save_restore(b"a\x1b[sb\x1b[uc"), b"a\x1b7b\x1b8c");
+    }
+
+    #[test]
+    fn other_sequences_are_left_alone() {
+        // CSI with a parameter is not the save/restore spelling.
+        assert_eq!(rewrite_save_restore(b"\x1b[1s"), b"\x1b[1s");
+        assert_eq!(rewrite_save_restore(b"\x1b[2J"), b"\x1b[2J");
+        assert_eq!(rewrite_save_restore(b"plain text"), b"plain text");
+    }
+
+    #[test]
+    fn a_partial_prefix_is_detected_at_the_end_only() {
+        assert_eq!(escape_prefix_len(b"text\x1b"), 1);
+        assert_eq!(escape_prefix_len(b"text\x1b["), 2);
+        assert_eq!(escape_prefix_len(b"text\x1b[3"), 0);
+        assert_eq!(escape_prefix_len(b""), 0);
     }
 }

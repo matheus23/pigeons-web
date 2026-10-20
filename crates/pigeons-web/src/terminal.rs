@@ -29,6 +29,8 @@ pub struct Terminal {
     cell_h: f64,
     title: String,
     cursor_visible: bool,
+    /// Tail of what the remote sent, for the byte dump.
+    received: std::collections::VecDeque<u8>,
     /// Translate bare LF to CRLF. A session without a pseudo-terminal delivers
     /// plain newlines; a real terminal's line discipline would add the CR, and
     /// without it every line starts where the previous one ended.
@@ -49,6 +51,7 @@ impl Terminal {
             cell_h,
             title: String::new(),
             cursor_visible: true,
+            received: std::collections::VecDeque::new(),
             crlf: false,
         };
         terminal.fit();
@@ -115,7 +118,32 @@ impl Terminal {
         self.crlf = crlf;
     }
 
+    /// Escaped tail of the bytes received from the remote.
+    ///
+    /// For terminal bugs the byte stream is the only reliable evidence, so this
+    /// is what `Ctrl+Shift+B` copies: a rendering oddity can then be reported
+    /// exactly instead of described.
+    pub fn received_dump(&self) -> String {
+        let mut out = String::with_capacity(self.received.len() * 2);
+        for byte in &self.received {
+            match byte {
+                b'\\' => out.push_str("\\\\"),
+                0x20..=0x7e => out.push(*byte as char),
+                b'\n' => out.push_str("\\n"),
+                b'\r' => out.push_str("\\r"),
+                0x1b => out.push_str("\\e"),
+                0x07 => out.push_str("\\a"),
+                _ => out.push_str(&format!("\\x{byte:02x}")),
+            }
+        }
+        out
+    }
+
     pub fn process(&mut self, bytes: &[u8]) {
+        self.received.extend(bytes);
+        while self.received.len() > 8192 {
+            self.received.pop_front();
+        }
         if self.crlf {
             let fixed = normalise_newlines(bytes);
             self.parser.process(&fixed);

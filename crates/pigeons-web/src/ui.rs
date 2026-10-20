@@ -183,6 +183,18 @@ impl App {
                     self.disconnect();
                     return None;
                 }
+                // Copy what the remote actually sent, for reporting a render bug.
+                "b" => {
+                    event.prevent_default();
+                    let (columns, rows) = self.term.size();
+                    let dump = format!("# {columns}x{rows}\n{}\n", self.term.received_dump());
+                    platform::log(&dump);
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let _ = platform::copy_text(&dump).await;
+                    });
+                    self.toast("received bytes copied");
+                    return None;
+                }
                 _ => {}
             }
         }

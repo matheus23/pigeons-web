@@ -74,6 +74,7 @@ features = [
   "Storage",
   "SubtleCrypto",
   "Text",
+  "WheelEvent",
   "VisualViewport",
   "Window",
 ]

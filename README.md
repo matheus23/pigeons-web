@@ -92,6 +92,13 @@ stream.
   events (so phone keyboards and IME work), while `keydown` handles only control
   keys. The layout follows `visualViewport`, so an open keyboard shrinks the
   terminal instead of hiding the cursor, and the resize is passed to the remote.
+- **Gestures**: a tap focuses (and returns to the live screen); a drag scrolls, so
+  a scroll gesture never reopens the keyboard. Where the drag scrolls depends on
+  the program: our history for a shell, cursor keys for a full-screen program
+  that is on the alternate screen, and mouse wheel reports for one that asked for
+  them — the same split xterm, VTE, Alacritty, tmux and Windows Terminal make.
+- **Extra keys**: touch devices get a row for `esc`, `tab`, a sticky `ctrl`, and
+  the four arrows, because a phone keyboard has none of them.
 - **Storage**: hosts and trusted host keys are JSON in `localStorage` — the
   `~/.ssh/config` equivalent. The key lives in `IndexedDB`, because a `CryptoKey`
   is not a string.
@@ -190,8 +197,12 @@ Ed25519, and behaviour when the relay is unreachable.
   authenticates the user rather than the transport identity.
 - **Browser connections are relay-only.** No hole punching: everything goes
   through a relay, which is fine for a shell and not great for bulk transfer.
-- **No scrollback view.** The emulator keeps history, but only the visible screen
-  is painted, so `PageUp` goes to the application.
+- **Scrolling follows whoever owns the screen.** A drag or the wheel moves the
+  page's own history (1000 lines) on a normal screen; on the alternate screen the
+  gesture becomes Up/Down for the program, unless that program asked for mouse
+  reports, in which case it gets wheel events. `PageUp` still goes to the
+  application, and there is no scrollbar — only a "how far back" badge that
+  returns you to the bottom.
 - **The SSH key is per origin.** It lives in that origin's IndexedDB, so moving
   the deployment to another host or port means trusting a new key on the server.
 - **No rekeying.** Fine for a session, not for a multi-gigabyte transfer.

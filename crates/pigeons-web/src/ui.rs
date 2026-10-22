@@ -45,6 +45,10 @@ pub async fn run() -> Result<()> {
         busy: false,
         connect_generation: 0,
         dial_cancel: None,
+        sticky_ctrl: false,
+        pointer: None,
+        pointer_x: 0.0,
+        pointer_y: 0.0,
     }));
 
     app.borrow_mut().self_ref = Rc::downgrade(&app);
@@ -90,6 +94,13 @@ struct App {
     connect_generation: u32,
     /// Set while a dial is in flight, so `disconnect` can abandon it.
     dial_cancel: Option<futures::channel::oneshot::Sender<()>>,
+    /// The on-screen Ctrl key is armed for the next character.
+    sticky_ctrl: bool,
+    /// Where the current pointer gesture started, and how far it has moved.
+    pointer: Option<Gesture>,
+    /// Pointer position in viewport coordinates, for mouse reports.
+    pointer_x: f64,
+    pointer_y: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -117,25 +128,65 @@ fn wire(app: &Rc<RefCell<App>>) {
         handle.borrow_mut().on_paste(event);
     });
 
-    // A soft keyboard only opens for a focused editable element, so a tap on the
-    // terminal focuses the invisible textarea. Pointer events cover touch and
-    // mouse with one handler.
+    // A tap focuses the input sink, which is what raises a soft keyboard; a drag
+    // scrolls instead. Focusing on pointerdown would reopen the keyboard the
+    // moment a scroll gesture starts, which makes scrollback unusable on a phone.
+    let surface: web_sys::EventTarget = platform::by_id::<HtmlElement>("terminal").into();
+
     let handle = app.clone();
-    platform::on::<web_sys::PointerEvent>(
-        &platform::by_id::<HtmlElement>("terminal").into(),
-        "pointerdown",
-        move |_| {
-            handle.borrow_mut().refocus();
+    platform::on::<web_sys::PointerEvent>(&surface, "pointerdown", move |event| {
+        handle.borrow_mut().pointer_down(event);
+    });
+
+    let handle = app.clone();
+    platform::on::<web_sys::PointerEvent>(&surface, "pointermove", move |event| {
+        handle.borrow_mut().pointer_move(event);
+    });
+
+    let handle = app.clone();
+    platform::on::<web_sys::PointerEvent>(&surface, "pointerup", move |event| {
+        handle.borrow_mut().pointer_up(event);
+    });
+
+    let handle = app.clone();
+    platform::on::<web_sys::PointerEvent>(&surface, "pointercancel", move |_| {
+        handle.borrow_mut().pointer = None;
+    });
+
+    // Wheel and trackpads scroll the same history on a desktop.
+    let handle = app.clone();
+    platform::on::<web_sys::WheelEvent>(&surface, "wheel", move |event| {
+        handle.borrow_mut().on_wheel(event);
+    });
+
+    // The extra keys a phone keyboard lacks. One handler for the whole row.
+    let handle = app.clone();
+    platform::on::<web_sys::MouseEvent>(
+        &platform::by_id::<HtmlElement>("keys").into(),
+        "click",
+        move |event| {
+            let Some(button) = event
+                .target()
+                .and_then(|target| target.dyn_into::<HtmlElement>().ok())
+            else {
+                return;
+            };
+            let key = button.get_attribute("data-key");
+            let modifier = button.get_attribute("data-mod");
+            handle
+                .borrow_mut()
+                .tap_key(key.as_deref(), modifier.as_deref());
         },
     );
 
-    // Fallback for browsers that do not deliver pointer events for touch.
+    // The badge that says how far back the view is; tapping it returns to the
+    // newest output.
     let handle = app.clone();
     platform::on::<web_sys::MouseEvent>(
-        &platform::by_id::<HtmlElement>("terminal").into(),
+        &platform::by_id::<HtmlElement>("scroll-back").into(),
         "click",
         move |_| {
-            handle.borrow_mut().refocus();
+            handle.borrow_mut().term.scroll_to_bottom();
         },
     );
 
@@ -196,6 +247,182 @@ fn wire(app: &Rc<RefCell<App>>) {
 }
 
 impl App {
+    /// Handles a tap on one of the extra keys.
+    fn tap_key(&mut self, key: Option<&str>, modifier: Option<&str>) {
+        if modifier == Some("ctrl") {
+            self.set_sticky_ctrl(!self.sticky_ctrl);
+            return;
+        }
+        let Some(key) = key else {
+            return;
+        };
+        match key {
+            "Escape" => self.send_key_bytes(b"\x1b"),
+            "Tab" => self.send_key_bytes(b"\t"),
+            "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" => self.send_arrow(key),
+            _ => {}
+        }
+        self.term.scroll_to_bottom();
+    }
+
+    /// Arms or disarms the sticky Ctrl key, and shows which it is.
+    fn set_sticky_ctrl(&mut self, armed: bool) {
+        self.sticky_ctrl = armed;
+        let Some(button) = platform::by_id::<HtmlElement>("keys")
+            .query_selector("[data-mod=\"ctrl\"]")
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        button.set_class_name(if armed { "active" } else { "" });
+    }
+
+    /// Sends raw key bytes to the session, if there is one.
+    fn send_key_bytes(&self, bytes: &[u8]) {
+        if let Some(session) = &self.session {
+            let _ = session.input.send(Input::Data(bytes.to_vec()));
+        }
+    }
+
+    /// Records where the pointer is, relative to the grid.
+    fn track_pointer(&mut self, event: &web_sys::PointerEvent) {
+        let box_ = self.term.viewport_origin();
+        self.pointer_x = event.client_x() as f64 - box_.0;
+        self.pointer_y = event.client_y() as f64 - box_.1;
+    }
+
+    /// Records where a gesture began; nothing is focused until it ends as a tap.
+    fn pointer_down(&mut self, event: web_sys::PointerEvent) {
+        self.track_pointer(&event);
+        self.pointer = Some(Gesture {
+            start_y: event.client_y() as f64,
+            last_y: event.client_y() as f64,
+            moved: 0.0,
+        });
+    }
+
+    /// Dragging scrolls through history, one row per cell height.
+    fn pointer_move(&mut self, event: web_sys::PointerEvent) {
+        self.track_pointer(&event);
+        let cell = self.term.cell_height();
+        let Some(gesture) = self.pointer.as_mut() else {
+            return;
+        };
+        let y = event.client_y() as f64;
+        let delta = y - gesture.last_y;
+        if delta == 0.0 {
+            return;
+        }
+        gesture.last_y = y;
+        gesture.moved += delta.abs();
+        let rows = (delta / cell).round() as i32;
+        if rows == 0 {
+            return;
+        }
+        event.prevent_default();
+        self.scroll_rows(rows);
+    }
+
+    /// A gesture that never really moved is a tap, and a tap means typing.
+    fn pointer_up(&mut self, event: web_sys::PointerEvent) {
+        let Some(gesture) = self.pointer.take() else {
+            return;
+        };
+        let travelled = (event.client_y() as f64 - gesture.start_y)
+            .abs()
+            .max(gesture.moved);
+        if travelled < TAP_SLOP {
+            self.refocus();
+        }
+    }
+
+    /// Wheel and trackpad scrolling.
+    fn on_wheel(&mut self, event: web_sys::WheelEvent) {
+        event.prevent_default();
+        let cell = self.term.cell_height();
+        let rows = match event.delta_mode() {
+            web_sys::WheelEvent::DOM_DELTA_LINE => -event.delta_y(),
+            web_sys::WheelEvent::DOM_DELTA_PAGE => {
+                -event.delta_y() * f64::from(self.term.size().rows)
+            }
+            _ => -(event.delta_y() / cell),
+        };
+        self.scroll_rows(rows.round() as i32);
+    }
+
+    /// Scrolls by `rows`: negative is towards newer output.
+    ///
+    /// Which direction the gesture means depends on who owns the screen. On a
+    /// shell it moves our history. On the alternate screen there is no history —
+    /// a full-screen program like `less` or `vim` keeps its own — so the drag
+    /// becomes Up/Down keys for that program, the way a wheel behaves in a
+    /// desktop terminal.
+    fn scroll_rows(&mut self, rows: i32) {
+        if rows == 0 {
+            return;
+        }
+        // Who owns the gesture decides what it means. A program that asked for
+        // mouse reports wants wheel events; a full-screen program owns its own
+        // scrolling and understands cursor keys; anything else is our history.
+        if self.term.wants_mouse() {
+            let button = if rows < 0 { 64 } else { 65 };
+            for _ in 0..rows.unsigned_abs() {
+                self.send_wheel(button);
+            }
+            return;
+        }
+        if self.term.alternate_screen() && self.term.alternate_scroll() {
+            for _ in 0..rows.unsigned_abs() {
+                let arrow = if rows < 0 { "ArrowUp" } else { "ArrowDown" };
+                self.send_arrow(arrow);
+            }
+            return;
+        }
+        self.term.scroll_by(rows);
+    }
+
+    /// Sends one wheel notch at the cell the pointer is over.
+    fn send_wheel(&mut self, button: u16) {
+        let Some((column, row)) = self.term.cell_at(self.pointer_x, self.pointer_y) else {
+            return;
+        };
+        let Some(session) = &self.session else {
+            return;
+        };
+        let bytes = if self.term.mouse_sgr() {
+            format!("\x1b[<{button};{};{}M", column + 1, row + 1)
+        } else {
+            // X10 encoding carries the button and both coordinates in single
+            // bytes offset by 32, so it cannot address anything past column 223.
+            // Coordinates are capped so they stay inside a single byte.
+            let x = u8::try_from(column).unwrap_or(191).min(223) + 32;
+            let y = u8::try_from(row).unwrap_or(191).min(223) + 32;
+            String::from_utf8_lossy(&[0x1b, b'[', b'M', 32 + button as u8, x, y]).into_owned()
+        };
+        let _ = session.input.send(Input::Data(bytes.into_bytes()));
+    }
+
+    /// Sends one cursor key, honouring application cursor mode.
+    fn send_arrow(&mut self, arrow: &str) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let final_byte = match arrow {
+            "ArrowUp" => "A",
+            "ArrowDown" => "B",
+            "ArrowRight" => "C",
+            "ArrowLeft" => "D",
+            _ => return,
+        };
+        let bytes = if self.term.application_cursor() {
+            format!("\x1bO{final_byte}")
+        } else {
+            format!("\x1b[{final_byte}")
+        };
+        let _ = session.input.send(Input::Data(bytes.into_bytes()));
+    }
+
     /// Focuses the invisible textarea, which is what raises a soft keyboard.
     fn refocus(&mut self) {
         if is_settings_open() {
@@ -210,6 +437,19 @@ impl App {
     fn on_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
+        }
+        // Typing always happens on the live screen, never against a viewport
+        // that does not show the cursor.
+        self.term.scroll_to_bottom();
+        if self.sticky_ctrl {
+            self.set_sticky_ctrl(false);
+            if let Some(bytes) = terminal::control_code(text) {
+                if let Some(session) = &self.session {
+                    let _ = session.input.send(Input::Data(bytes));
+                }
+                self.refocus();
+                return;
+            }
         }
         match &self.session {
             Some(session) => {
@@ -250,6 +490,10 @@ impl App {
         if is_form_target(&event) {
             return None;
         }
+
+        // Any keystroke means the user is back at the prompt, so leave whatever
+        // was being read in history.
+        self.term.scroll_to_bottom();
 
         // A dial is in flight: the prompt is gone, so swallow typing rather than
         // printing characters over the spinner line. The shortcuts below still
@@ -1357,6 +1601,17 @@ fn spawn_spinner(app: Rc<RefCell<App>>, generation: u32) {
         }
     });
 }
+
+/// A pointer gesture on the terminal surface.
+struct Gesture {
+    start_y: f64,
+    last_y: f64,
+    /// Total vertical travel, so a slow drag is not mistaken for a tap.
+    moved: f64,
+}
+
+/// How far a gesture may travel and still count as a tap.
+const TAP_SLOP: f64 = 8.0;
 
 /// The invisible textarea that holds keyboard focus.
 fn keyboard() -> web_sys::HtmlTextAreaElement {

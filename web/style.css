@@ -547,3 +547,64 @@ body {
     display: none;
   }
 }
+
+/* ------------------------------------------------------------ scrollback */
+
+/* Dragging is ours: the page itself cannot scroll, and letting the browser
+   claim the gesture cancels our pointer events mid-drag. */
+.terminal {
+  touch-action: none;
+}
+
+.scroll-back {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  display: none;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  color: var(--dim);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.scroll-back.visible {
+  display: block;
+}
+
+/* ------------------------------------------------------------- extra keys */
+
+/* A phone keyboard has no Esc, Tab, Ctrl or arrows. */
+.keys {
+  display: none;
+  gap: 6px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--line);
+}
+
+.keys button {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: 13px;
+}
+
+.keys button:active,
+.keys button.active {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+
+@media (pointer: coarse) {
+  .keys {
+    display: flex;
+  }
+}

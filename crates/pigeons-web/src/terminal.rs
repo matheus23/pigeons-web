@@ -59,27 +59,12 @@ pub struct Terminal {
     received: std::collections::VecDeque<u8>,
     /// How many lines the view is scrolled back from the bottom of history.
     scroll: usize,
-    /// Line count at the last render, so new output does not move a scrolled view.
-    last_total: usize,
     /// Shown while the view is not at the bottom; tapping it jumps back.
     scroll_back: HtmlElement,
-    /// A full-screen program owns the screen (and its own scrolling).
-    alternate_screen: bool,
-    /// DECSET 1007: on the alternate screen, wheel and drag become cursor keys.
-    ///
-    /// xterm defaults its equivalent resource to off and waits for applications
-    /// to ask; VTE and Alacritty behave as though it is already on. Defaulting to
-    /// on is what makes `less` and `vim` scrollable on a phone, and an
-    /// application that wants the wheel for itself turns it off.
-    alternate_scroll: bool,
-    /// The application asked for mouse reports (DECSET 1000, 1002 or 1003).
-    mouse_tracking: bool,
-    /// Mouse reports use the SGR encoding (DECSET 1006).
-    sgr_mouse: bool,
-    /// Bracketed paste mode (DECSET 2004), which the page has to honour itself.
-    bracketed_paste: bool,
-    /// Tail kept between chunks so a split 2004 sequence is still seen.
-    paste_tail: Vec<u8>,
+    /// The DECSET modes the page itself acts on.
+    modes: Modes,
+    /// Tail of a mode sequence cut off by a chunk boundary.
+    mode_tail: Vec<u8>,
 }
 
 impl Terminal {
@@ -102,14 +87,9 @@ impl Terminal {
             crlf: false,
             received: std::collections::VecDeque::new(),
             scroll: 0,
-            last_total: 0,
             scroll_back: platform::by_id("scroll-back"),
-            alternate_screen: false,
-            alternate_scroll: true,
-            mouse_tracking: false,
-            sgr_mouse: false,
-            bracketed_paste: false,
-            paste_tail: Vec::new(),
+            modes: Modes::initial(),
+            mode_tail: Vec::new(),
         };
         terminal.fit();
         terminal
@@ -255,37 +235,31 @@ impl Terminal {
         }
         self.pending_utf8 = pending[consumed..].to_vec();
 
-        self.track_bracketed_paste(&data);
-        self.track_alternate_screen(&data);
-        self.track_input_modes(&data);
-        for ch in decoded.chars() {
-            self.vt.feed(ch);
+        // One parser for every private mode the page acts on; entering the
+        // alternate screen drops whatever history the view was reading.
+        if scan_modes(&mut self.modes, &mut self.mode_tail, &data) {
+            self.scroll = 0;
+        }
+        let previous_total = self.total_lines();
+        let discarded = {
+            let changes = self.vt.feed_str(&decoded);
+            // Lines this chunk pushed out of the buffer entirely, which happens
+            // once history is at its limit.
+            changes.scrollback.count()
+        };
+        if self.scroll > 0 {
+            // A scrolled-back view stays on the lines it was showing: every line
+            // that leaves the screen moves it back by one, whether the line went
+            // into history or was discarded at the limit.
+            let advance = pinned_advance(previous_total, self.total_lines(), discarded);
+            self.scroll = self.scroll.saturating_add(advance);
         }
         self.render();
     }
 
     /// Whether a full-screen program is using the alternate screen.
     pub fn alternate_screen(&self) -> bool {
-        self.alternate_screen
-    }
-
-    /// Watches for the alternate-screen toggles.
-    ///
-    /// The emulator tracks this internally but does not expose it, and the page
-    /// needs it: on the alternate screen there is no history to scroll, so a drag
-    /// belongs to the program instead.
-    fn track_alternate_screen(&mut self, data: &[u8]) {
-        const ON: [&[u8]; 3] = [b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
-        const OFF: [&[u8]; 3] = [b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
-        for window in data.windows(8) {
-            if ON.contains(&window) {
-                self.alternate_screen = true;
-                // Nothing from before is reachable while the program is in charge.
-                self.scroll = 0;
-            } else if OFF.contains(&window) {
-                self.alternate_screen = false;
-            }
-        }
+        self.modes.alternate_screen
     }
 
     /// One character cell's height, for turning a drag into rows.
@@ -323,15 +297,7 @@ impl Terminal {
 
     /// Whether the remote asked for pastes to be wrapped in `CSI 200 ~`.
     pub fn bracketed_paste(&self) -> bool {
-        self.bracketed_paste
-    }
-
-    /// Watches the incoming bytes for the bracketed paste toggle.
-    ///
-    /// The emulator eats these sequences without exposing the mode, but the page has
-    /// to know: an unbracketed multi-line paste runs as soon as it arrives.
-    fn track_bracketed_paste(&mut self, data: &[u8]) {
-        scan_bracketed_paste(&mut self.bracketed_paste, &mut self.paste_tail, data);
+        self.modes.bracketed_paste
     }
 
     /// Writes text with newline translation, for locally generated output.
@@ -347,9 +313,18 @@ impl Terminal {
             .scrollback_limit(SCROLLBACK)
             .build();
         self.painted.clear();
-        // Paste mode belongs to the session that asked for it.
-        self.bracketed_paste = false;
-        self.paste_tail.clear();
+        // Input modes and the scroll position belong to the session that set
+        // them: a session that dies inside htop must not leave the page sending
+        // wheel reports to nobody.
+        self.modes = Modes::initial();
+        self.mode_tail.clear();
+        self.scroll = 0;
+    }
+
+    /// Forgets the modes a session set, without touching the screen.
+    pub fn reset_input_modes(&mut self) {
+        self.modes = Modes::initial();
+        self.mode_tail.clear();
     }
 
     /// Plain text of the visible screen, used for copying.
@@ -372,13 +347,7 @@ impl Terminal {
             (columns as u16, rows as u16)
         };
 
-        // Keep a scrolled-back view pinned to the lines it was showing when more
-        // output arrives, instead of silently following the bottom again.
         let total = self.total_lines();
-        if self.scroll > 0 && total > self.last_total {
-            self.scroll += total - self.last_total;
-        }
-        self.last_total = total;
         let window = rows as usize;
         let furthest = total.saturating_sub(window);
         if self.scroll > furthest {
@@ -455,6 +424,40 @@ impl Terminal {
                 },
             )
             .ok();
+    }
+    /// Whether the application asked for mouse reports.
+    pub fn wants_mouse(&self) -> bool {
+        self.modes.mouse_tracking
+    }
+
+    /// Whether mouse reports should use the SGR encoding.
+    pub fn mouse_sgr(&self) -> bool {
+        self.modes.sgr_mouse
+    }
+
+    /// Whether wheel and drag become cursor keys on the alternate screen.
+    pub fn alternate_scroll(&self) -> bool {
+        self.modes.alternate_scroll
+    }
+
+    /// The cell under a viewport-relative point, for mouse reports.
+    pub fn cell_at(&self, x: f64, y: f64) -> Option<(u16, u16)> {
+        let Size { columns, rows } = self.size();
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let column = (x / self.cell_w) as u16;
+        let row = (y / self.cell_h) as u16;
+        if column >= columns || row >= rows {
+            return None;
+        }
+        Some((column, row))
+    }
+
+    /// The grid's position on the page, so pointer coordinates become cells.
+    pub fn viewport_origin(&self) -> (f64, f64) {
+        let rect = self.viewport.get_bounding_client_rect();
+        (rect.left(), rect.top())
     }
 }
 
@@ -589,25 +592,109 @@ fn measure_cell() -> (f64, f64) {
     (width, height)
 }
 
-/// Updates the bracketed-paste flag from the incoming bytes.
-///
-/// `tail` carries the last few bytes between calls, so a sequence split across
-/// two reads is still recognised.
-fn scan_bracketed_paste(enabled: &mut bool, tail: &mut Vec<u8>, data: &[u8]) {
-    const ON: &[u8] = b"\x1b[?2004h";
-    const OFF: &[u8] = b"\x1b[?2004l";
+/// The DECSET/DECRST modes whose state the page has to know.
+#[derive(Debug, Clone, Copy)]
+struct Modes {
+    bracketed_paste: bool,
+    alternate_screen: bool,
+    alternate_scroll: bool,
+    mouse_tracking: bool,
+    sgr_mouse: bool,
+}
 
-    let mut scan = std::mem::take(tail);
-    scan.extend_from_slice(data);
-    for window in scan.windows(ON.len()) {
-        if window == ON {
-            *enabled = true;
-        } else if window == OFF {
-            *enabled = false;
+impl Modes {
+    fn initial() -> Self {
+        Self {
+            bracketed_paste: false,
+            alternate_screen: false,
+            // On by default: that is what makes a pager scrollable on a phone,
+            // and a program that wants the wheel for itself turns it off.
+            alternate_scroll: true,
+            mouse_tracking: false,
+            sgr_mouse: false,
         }
     }
-    let keep = (ON.len() - 1).min(scan.len());
-    *tail = scan[scan.len() - keep..].to_vec();
+}
+
+/// Applies one private mode, returning whether the page tracks it.
+fn apply_mode(modes: &mut Modes, parameter: &str, enable: bool) -> bool {
+    match parameter {
+        "47" | "1047" | "1049" => modes.alternate_screen = enable,
+        "1000" | "1002" | "1003" => modes.mouse_tracking = enable,
+        "1006" => modes.sgr_mouse = enable,
+        "1007" => modes.alternate_scroll = enable,
+        "2004" => modes.bracketed_paste = enable,
+        _ => return false,
+    }
+    true
+}
+
+/// Scans private mode runs (`ESC [ ? <params> h` or `l`) and updates the modes.
+///
+/// These sequences all have the same shape, so they are parsed once instead of
+/// matched per mode: matching per mode is how `?47h` came to never match, and how
+/// a combined `?1002;1006h` only half applied. `tail` holds a sequence cut off by
+/// a chunk boundary until the next read.
+///
+/// Returns whether the alternate screen was entered, which drops history.
+fn scan_modes(modes: &mut Modes, tail: &mut Vec<u8>, data: &[u8]) -> bool {
+    let mut buffer = std::mem::take(tail);
+    buffer.extend_from_slice(data);
+    let mut entered_alternate = false;
+    let mut index = 0;
+
+    while index < buffer.len() {
+        let starts_mode = buffer[index] == 0x1b
+            && buffer.get(index + 1) == Some(&b'[')
+            && buffer.get(index + 2) == Some(&b'?');
+        if !starts_mode {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 3;
+        let mut parameters = String::new();
+        while cursor < buffer.len() && (buffer[cursor].is_ascii_digit() || buffer[cursor] == b';') {
+            parameters.push(buffer[cursor] as char);
+            cursor += 1;
+        }
+        let Some(&final_byte) = buffer.get(cursor) else {
+            // Cut off mid-sequence: keep it for the next chunk.
+            break;
+        };
+        if final_byte != b'h' && final_byte != b'l' {
+            index = cursor + 1;
+            continue;
+        }
+        let enable = final_byte == b'h';
+        for parameter in parameters.split(';').filter(|part| !part.is_empty()) {
+            if apply_mode(modes, parameter, enable)
+                && enable
+                && matches!(parameter, "47" | "1047" | "1049")
+            {
+                entered_alternate = true;
+            }
+        }
+        index = cursor + 1;
+    }
+
+    *tail = buffer[index..].to_vec();
+    // A malformed sequence must not make the tail grow without limit.
+    if tail.len() > 32 {
+        let excess = tail.len() - 32;
+        tail.drain(..excess);
+    }
+    entered_alternate
+}
+
+/// How far a pinned view moves back when a chunk of output arrives.
+///
+/// The buffer grows while history has room, and starts discarding from the front
+/// once it is full; either way the content under a scrolled-back view moves back
+/// by that many lines.
+fn pinned_advance(previous_total: usize, total: usize, discarded: usize) -> usize {
+    total
+        .saturating_sub(previous_total)
+        .saturating_add(discarded)
 }
 
 /// Adds a carriage return before every line feed that lacks one.
@@ -622,6 +709,30 @@ fn normalise_newlines(bytes: &[u8]) -> Vec<u8> {
         previous = byte;
     }
     out
+}
+
+/// Turns a single typed character into the control code a Ctrl chord would send.
+///
+/// Used by the on-screen Ctrl key, which cannot hold a modifier down: the next
+/// character typed is folded instead.
+pub fn control_code(text: &str) -> Option<Vec<u8>> {
+    let mut chars = text.chars();
+    let (Some(first), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    let byte = match first {
+        '@' => 0x00,
+        'a'..='z' => first as u8 - b'a' + 1,
+        'A'..='Z' => first as u8 - b'A' + 1,
+        '[' => 0x1b,
+        '\\' => 0x1c,
+        ']' => 0x1d,
+        '^' => 0x1e,
+        '_' | '/' | '-' => 0x1f,
+        '?' => 0x7f,
+        _ => return None,
+    };
+    Some(vec![byte])
 }
 
 /// Translates a key event into the bytes a terminal would send.
@@ -728,7 +839,14 @@ pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_paste, normalise_newlines, scan_bracketed_paste};
+    use super::{Modes, control_code, encode_paste, normalise_newlines, scan_modes};
+
+    fn scan(data: &[u8]) -> (Modes, bool) {
+        let mut modes = Modes::initial();
+        let mut tail = Vec::new();
+        let entered = scan_modes(&mut modes, &mut tail, data);
+        (modes, entered)
+    }
 
     #[test]
     fn newline_translation_adds_only_missing_carriage_returns() {
@@ -736,24 +854,66 @@ mod tests {
         assert_eq!(normalise_newlines(b"a\r\nb"), b"a\r\nb");
         assert_eq!(normalise_newlines(b"a\rb"), b"a\rb");
     }
+
     #[test]
     fn bracketed_paste_follows_the_mode_the_server_set() {
-        let mut enabled = false;
-        let mut tail = Vec::new();
-        scan_bracketed_paste(&mut enabled, &mut tail, b"\x1b[?2004h");
-        assert!(enabled);
-        scan_bracketed_paste(&mut enabled, &mut tail, b"output \x1b[?2004l more");
-        assert!(!enabled);
+        let (modes, _) = scan(b"\x1b[?2004h");
+        assert!(modes.bracketed_paste);
+        let (modes, _) = scan(b"output \x1b[?2004l more");
+        assert!(!modes.bracketed_paste);
     }
 
     #[test]
-    fn bracketed_paste_toggle_split_across_reads_is_still_seen() {
-        let mut enabled = false;
+    fn a_sequence_split_across_reads_is_still_seen() {
+        let mut modes = Modes::initial();
         let mut tail = Vec::new();
-        scan_bracketed_paste(&mut enabled, &mut tail, b"\x1b[?20");
-        assert!(!enabled);
-        scan_bracketed_paste(&mut enabled, &mut tail, b"04h");
-        assert!(enabled);
+        scan_modes(&mut modes, &mut tail, b"\x1b[?20");
+        assert!(!modes.bracketed_paste);
+        scan_modes(&mut modes, &mut tail, b"04h");
+        assert!(modes.bracketed_paste);
+    }
+
+    #[test]
+    fn every_alternate_screen_spelling_is_recognised() {
+        // Three ways to ask for it, and the short one used to never match.
+        for enter in ["\x1b[?47h", "\x1b[?1047h", "\x1b[?1049h"] {
+            let (modes, entered) = scan(enter.as_bytes());
+            assert!(modes.alternate_screen, "{enter:?}");
+            assert!(entered, "{enter:?}");
+        }
+        let (modes, entered) = scan(b"\x1b[?1049l");
+        assert!(!modes.alternate_screen);
+        assert!(!entered);
+    }
+
+    #[test]
+    fn mouse_modes_and_their_encoding_are_tracked() {
+        let (modes, _) = scan(b"\x1b[?1000h\x1b[?1006h");
+        assert!(modes.mouse_tracking && modes.sgr_mouse);
+        let (modes, _) = scan(b"\x1b[?1000l");
+        assert!(!modes.mouse_tracking);
+    }
+
+    #[test]
+    fn combined_parameters_are_each_applied() {
+        let (modes, _) = scan(b"\x1b[?1002;1006;1007h");
+        assert!(modes.mouse_tracking && modes.sgr_mouse);
+        assert!(modes.alternate_scroll);
+    }
+
+    #[test]
+    fn alternate_scroll_defaults_on_and_can_be_declined() {
+        assert!(Modes::initial().alternate_scroll);
+        let (modes, _) = scan(b"\x1b[?1007l");
+        assert!(!modes.alternate_scroll);
+    }
+
+    #[test]
+    fn unrelated_private_modes_are_ignored() {
+        let (modes, _) = scan(b"\x1b[?25l\x1b[?7h\x1b[?1004h");
+        assert!(!modes.mouse_tracking && !modes.sgr_mouse && !modes.bracketed_paste);
+        assert!(!modes.alternate_screen);
+        assert!(modes.alternate_scroll);
     }
 
     #[test]
@@ -766,174 +926,6 @@ mod tests {
             b"\x1b[200~one\rtwo\x1b[201~"
         );
     }
-}
-
-/// Parses `ESC [ ? <n> h` / `ESC [ ? <n> l` runs.
-///
-/// Only the private modes this page acts on are recognised; everything else is
-/// left to the emulator.
-fn scan_input_modes(
-    mouse_tracking: &mut bool,
-    sgr_mouse: &mut bool,
-    alternate_scroll: &mut bool,
-    data: &[u8],
-) {
-    let mut index = 0;
-    while index + 2 < data.len() {
-        if data[index] != 0x1b || data[index + 1] != b'[' || data[index + 2] != b'?' {
-            index += 1;
-            continue;
-        }
-        // Collect the parameter list and the final byte.
-        let mut parameters = String::new();
-        let mut cursor = index + 3;
-        let mut final_byte = None;
-        while cursor < data.len() {
-            let byte = data[cursor];
-            if byte.is_ascii_digit() || byte == b';' {
-                parameters.push(byte as char);
-            } else {
-                final_byte = Some(byte);
-                break;
-            }
-            cursor += 1;
-        }
-        let Some(final_byte) = final_byte else {
-            // The sequence continues in the next chunk; drop the fragment.
-            return;
-        };
-        let enable = match final_byte {
-            b'h' => true,
-            b'l' => false,
-            _ => {
-                index = cursor + 1;
-                continue;
-            }
-        };
-        for parameter in parameters.split(';').filter(|part| !part.is_empty()) {
-            match parameter {
-                "1000" | "1002" | "1003" => *mouse_tracking = enable,
-                "1006" => *sgr_mouse = enable,
-                "1007" => *alternate_scroll = enable,
-                _ => {}
-            }
-        }
-        index = cursor + 1;
-    }
-}
-
-impl Terminal {
-    /// Watches for the private modes that decide who owns a scroll gesture.
-    fn track_input_modes(&mut self, data: &[u8]) {
-        scan_input_modes(
-            &mut self.mouse_tracking,
-            &mut self.sgr_mouse,
-            &mut self.alternate_scroll,
-            data,
-        );
-    }
-
-    /// Whether the application asked for mouse reports.
-    pub fn wants_mouse(&self) -> bool {
-        self.mouse_tracking
-    }
-
-    /// Whether mouse reports should use the SGR encoding.
-    pub fn mouse_sgr(&self) -> bool {
-        self.sgr_mouse
-    }
-
-    /// Whether wheel and drag become cursor keys on the alternate screen.
-    pub fn alternate_scroll(&self) -> bool {
-        self.alternate_scroll
-    }
-}
-
-impl Terminal {
-    /// The cell under a viewport-relative point, for mouse reports.
-    pub fn cell_at(&self, x: f64, y: f64) -> Option<(u16, u16)> {
-        let Size { columns, rows } = self.size();
-        if x < 0.0 || y < 0.0 {
-            return None;
-        }
-        let column = (x / self.cell_w) as u16;
-        let row = (y / self.cell_h) as u16;
-        if column >= columns || row >= rows {
-            return None;
-        }
-        Some((column, row))
-    }
-}
-
-impl Terminal {
-    /// The grid's position on the page, so pointer coordinates can be turned
-    /// into cells.
-    pub fn viewport_origin(&self) -> (f64, f64) {
-        let rect = self.viewport.get_bounding_client_rect();
-        (rect.left(), rect.top())
-    }
-}
-
-/// Turns a single typed character into the control code a Ctrl chord would send.
-///
-/// Used by the on-screen Ctrl key, which cannot hold a modifier down: the next
-/// character typed is folded instead.
-pub fn control_code(text: &str) -> Option<Vec<u8>> {
-    let mut chars = text.chars();
-    let (Some(first), None) = (chars.next(), chars.next()) else {
-        return None;
-    };
-    let byte = match first {
-        '@' => 0x00,
-        'a'..='z' => first as u8 - b'a' + 1,
-        'A'..='Z' => first as u8 - b'A' + 1,
-        '[' => 0x1b,
-        '\\' => 0x1c,
-        ']' => 0x1d,
-        '^' => 0x1e,
-        '_' | '/' | '-' => 0x1f,
-        '?' => 0x7f,
-        _ => return None,
-    };
-    Some(vec![byte])
-}
-
-#[cfg(test)]
-mod input_mode_tests {
-    use super::{control_code, scan_input_modes};
-
-    #[test]
-    fn mouse_and_alternate_scroll_modes_are_tracked() {
-        let (mut mouse, mut sgr, mut alt) = (false, false, true);
-        scan_input_modes(
-            &mut mouse,
-            &mut sgr,
-            &mut alt,
-            b"\x1b[?1049h\x1b[?1000h\x1b[?1006h",
-        );
-        assert!(mouse && sgr);
-        scan_input_modes(&mut mouse, &mut sgr, &mut alt, b"\x1b[?1000l");
-        assert!(!mouse);
-        // An application can decline the wheel-to-arrows translation.
-        scan_input_modes(&mut mouse, &mut sgr, &mut alt, b"\x1b[?1007l");
-        assert!(!alt);
-        scan_input_modes(&mut mouse, &mut sgr, &mut alt, b"\x1b[?1007h");
-        assert!(alt);
-    }
-
-    #[test]
-    fn combined_parameters_are_each_applied() {
-        let (mut mouse, mut sgr, mut alt) = (false, false, false);
-        scan_input_modes(&mut mouse, &mut sgr, &mut alt, b"\x1b[?1002;1006h");
-        assert!(mouse && sgr);
-    }
-
-    #[test]
-    fn unrelated_private_modes_are_ignored() {
-        let (mut mouse, mut sgr, mut alt) = (false, false, false);
-        scan_input_modes(&mut mouse, &mut sgr, &mut alt, b"\x1b[?25l\x1b[?2004h");
-        assert!(!mouse && !sgr && !alt);
-    }
 
     #[test]
     fn control_codes_follow_the_ctrl_chord() {
@@ -944,5 +936,20 @@ mod input_mode_tests {
         // Not a single character, so nothing to fold.
         assert_eq!(control_code("ab"), None);
         assert_eq!(control_code("1"), None);
+    }
+}
+
+#[cfg(test)]
+mod pinning_tests {
+    use super::pinned_advance;
+
+    #[test]
+    fn a_pinned_view_moves_with_the_lines_that_leave_it() {
+        // History still has room: the buffer grew by eight lines.
+        assert_eq!(pinned_advance(3, 11, 0), 8);
+        // History is full: the buffer stayed the same size but discarded 14.
+        assert_eq!(pinned_advance(7, 7, 14), 14);
+        // Nothing arrived.
+        assert_eq!(pinned_advance(11, 11, 0), 0);
     }
 }

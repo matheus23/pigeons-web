@@ -49,6 +49,7 @@ pub async fn run() -> Result<()> {
         pointer: None,
         pointer_x: 0.0,
         pointer_y: 0.0,
+        wheel_pending: 0.0,
     }));
 
     app.borrow_mut().self_ref = Rc::downgrade(&app);
@@ -101,6 +102,8 @@ struct App {
     /// Pointer position in viewport coordinates, for mouse reports.
     pointer_x: f64,
     pointer_y: f64,
+    /// Wheel rows not yet reached, carried across events.
+    wheel_pending: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +160,13 @@ fn wire(app: &Rc<RefCell<App>>) {
     let handle = app.clone();
     platform::on::<web_sys::WheelEvent>(&surface, "wheel", move |event| {
         handle.borrow_mut().on_wheel(event);
+    });
+
+    // A key press must not steal focus from the hidden textarea: blurring it
+    // closes the phone keyboard, which makes the row unusable.
+    let row: web_sys::EventTarget = platform::by_id::<HtmlElement>("keys").into();
+    platform::on::<web_sys::PointerEvent>(&row, "pointerdown", move |event| {
+        event.prevent_default();
     });
 
     // The extra keys a phone keyboard lacks. One handler for the whole row.
@@ -299,6 +309,7 @@ impl App {
             start_y: event.client_y() as f64,
             last_y: event.client_y() as f64,
             moved: 0.0,
+            pending: 0.0,
         });
     }
 
@@ -316,14 +327,18 @@ impl App {
         }
         gesture.last_y = y;
         gesture.moved += delta.abs();
-        let rows = (delta / cell).round() as i32;
-        if rows == 0 {
+        // Phone events arrive a few pixels apart, so the delta nearly always
+        // falls short of a cell. Carry the fraction instead of rounding each
+        // event away, or a slow drag does nothing at all.
+        gesture.pending += delta / cell;
+        let rows = gesture.pending.trunc();
+        if rows == 0.0 {
             return;
         }
+        gesture.pending -= rows;
         event.prevent_default();
-        self.scroll_rows(rows);
+        self.scroll_rows(rows as i32);
     }
-
     /// A gesture that never really moved is a tap, and a tap means typing.
     fn pointer_up(&mut self, event: web_sys::PointerEvent) {
         let Some(gesture) = self.pointer.take() else {
@@ -348,9 +363,15 @@ impl App {
             }
             _ => -(event.delta_y() / cell),
         };
-        self.scroll_rows(rows.round() as i32);
+        // Trackpad deltas are fractional; accumulate them across events.
+        self.wheel_pending += rows;
+        let whole = self.wheel_pending.trunc();
+        if whole == 0.0 {
+            return;
+        }
+        self.wheel_pending -= whole;
+        self.scroll_rows(whole as i32);
     }
-
     /// Scrolls by `rows`: negative is towards newer output.
     ///
     /// Which direction the gesture means depends on who owns the screen. On a
@@ -366,20 +387,34 @@ impl App {
         // mouse reports wants wheel events; a full-screen program owns its own
         // scrolling and understands cursor keys; anything else is our history.
         if self.term.wants_mouse() {
-            let button = if rows < 0 { 64 } else { 65 };
+            let button = Self::wheel_button(rows);
             for _ in 0..rows.unsigned_abs() {
                 self.send_wheel(button);
             }
             return;
         }
         if self.term.alternate_screen() && self.term.alternate_scroll() {
+            let arrow = Self::scroll_key(rows);
             for _ in 0..rows.unsigned_abs() {
-                let arrow = if rows < 0 { "ArrowUp" } else { "ArrowDown" };
                 self.send_arrow(arrow);
             }
             return;
         }
         self.term.scroll_by(rows);
+    }
+
+    /// The cursor key a scroll means for a program that owns the screen.
+    ///
+    /// Rows are measured like the history branch: positive means "further back",
+    /// which is Up for the program too. Getting this the other way round makes
+    /// scrolling in a pager go backwards.
+    fn scroll_key(rows: i32) -> &'static str {
+        if rows > 0 { "ArrowUp" } else { "ArrowDown" }
+    }
+
+    /// The wheel button a scroll means for a program that asked for mouse reports.
+    fn wheel_button(rows: i32) -> u16 {
+        if rows > 0 { 64 } else { 65 }
     }
 
     /// Sends one wheel notch at the cell the pointer is over.
@@ -391,16 +426,17 @@ impl App {
             return;
         };
         let bytes = if self.term.mouse_sgr() {
-            format!("\x1b[<{button};{};{}M", column + 1, row + 1)
+            format!("\x1b[<{button};{};{}M", column + 1, row + 1).into_bytes()
         } else {
-            // X10 encoding carries the button and both coordinates in single
-            // bytes offset by 32, so it cannot address anything past column 223.
-            // Coordinates are capped so they stay inside a single byte.
+            // X10 carries the button and both coordinates as single bytes offset
+            // by 32, so anything past column 223 cannot be addressed. These are
+            // raw bytes on purpose: coordinates above 95 push them past 127, and
+            // they are not text.
             let x = u8::try_from(column).unwrap_or(191).min(223) + 32;
             let y = u8::try_from(row).unwrap_or(191).min(223) + 32;
-            String::from_utf8_lossy(&[0x1b, b'[', b'M', 32 + button as u8, x, y]).into_owned()
+            vec![0x1b, b'[', b'M', 32 + button as u8, x, y]
         };
-        let _ = session.input.send(Input::Data(bytes.into_bytes()));
+        let _ = session.input.send(Input::Data(bytes));
     }
 
     /// Sends one cursor key, honouring application cursor mode.
@@ -441,12 +477,12 @@ impl App {
         // Typing always happens on the live screen, never against a viewport
         // that does not show the cursor.
         self.term.scroll_to_bottom();
-        if self.sticky_ctrl {
+        if self.sticky_ctrl && self.session.is_some() {
             self.set_sticky_ctrl(false);
-            if let Some(bytes) = terminal::control_code(text) {
-                if let Some(session) = &self.session {
-                    let _ = session.input.send(Input::Data(bytes));
-                }
+            if let Some(bytes) = terminal::control_code(text)
+                && let Some(session) = &self.session
+            {
+                let _ = session.input.send(Input::Data(bytes));
                 self.refocus();
                 return;
             }
@@ -1000,6 +1036,10 @@ impl App {
         self.busy = false;
         self.connect_generation = self.connect_generation.wrapping_add(1);
         self.term.set_crlf(false);
+        // The modes belong to the session; a session that dies inside htop must
+        // not leave drags sending wheel reports to nobody.
+        self.term.reset_input_modes();
+        self.set_sticky_ctrl(false);
         // Take the spinner line back before printing the outcome on it.
         if was_connecting {
             self.term.write("\r\x1b[K");
@@ -1608,6 +1648,8 @@ struct Gesture {
     last_y: f64,
     /// Total vertical travel, so a slow drag is not mistaken for a tap.
     moved: f64,
+    /// Rows not yet reached, carried across pointer events.
+    pending: f64,
 }
 
 /// How far a gesture may travel and still count as a tap.
@@ -1616,4 +1658,21 @@ const TAP_SLOP: f64 = 8.0;
 /// The invisible textarea that holds keyboard focus.
 fn keyboard() -> web_sys::HtmlTextAreaElement {
     platform::by_id("keyboard")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::App;
+
+    #[test]
+    fn scrolling_back_reaches_the_program_as_up() {
+        // Rows are measured like the history branch: positive is further back,
+        // which is Up for the program and wheel-up for one that asked for mouse
+        // reports. Inverting these makes a pager scroll the wrong way.
+        assert_eq!(App::scroll_key(1), "ArrowUp");
+        assert_eq!(App::scroll_key(40), "ArrowUp");
+        assert_eq!(App::scroll_key(-1), "ArrowDown");
+        assert_eq!(App::wheel_button(1), 64);
+        assert_eq!(App::wheel_button(-3), 65);
+    }
 }

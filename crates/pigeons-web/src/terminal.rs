@@ -262,6 +262,9 @@ impl Terminal {
             .scrollback_limit(SCROLLBACK)
             .build();
         self.painted.clear();
+        // Paste mode belongs to the session that asked for it.
+        self.bracketed_paste = false;
+        self.paste_tail.clear();
     }
 
     /// Plain text of the visible screen, used for copying.

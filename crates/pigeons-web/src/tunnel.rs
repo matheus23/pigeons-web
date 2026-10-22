@@ -12,6 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use futures::future::{FutureExt, LocalBoxFuture, Shared};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -22,65 +23,75 @@ use crate::platform::Result;
 const PIGEONS_ALPN: &[u8] = b"/pigeons/0";
 
 thread_local! {
-    /// The endpoint, or the reason binding it failed, so concurrent callers
-    /// share one outcome instead of each binding their own.
-    static ENDPOINT: RefCell<Option<Result<iroh::Endpoint>>> = const { RefCell::new(None) };
-    /// True while one caller is inside `bind()`.
-    static BINDING: Cell<bool> = const { Cell::new(false) };
+    /// The bind in flight or the endpoint it produced, tagged with the attempt
+    /// number so a stale failure cannot clear a newer attempt.
+    static ENDPOINT: RefCell<Option<(u32, BindFuture)>> = const { RefCell::new(None) };
+    static ATTEMPT: Cell<u32> = const { Cell::new(0) };
+    /// The bound endpoint, once there is one, for introspection.
+    static BOUND: RefCell<Option<iroh::Endpoint>> = const { RefCell::new(None) };
 }
 
-/// Clears the binding flag however the bind ends, including cancellation.
-struct Binding;
+/// One bind, shared by everyone waiting on it.
+type BindFuture = Shared<LocalBoxFuture<'static, Result<iroh::Endpoint>>>;
 
-impl Drop for Binding {
-    fn drop(&mut self) {
-        BINDING.with(|flag| flag.set(false));
-    }
-}
-
-/// The page's iroh endpoint, bound on first use.
+/// The page's iroh endpoint, binding it on first use.
 ///
-/// Two callers can arrive before either has finished binding, so the first takes
-/// the flag and the others wait for its outcome; otherwise each would bind a
-/// separate endpoint with a separate key.
+/// Callers that arrive while a bind is in flight await the same future instead of
+/// starting a second endpoint with a second key. A failure is forgotten, so a
+/// later attempt — after the network comes back, say — can bind again without a
+/// page reload.
 pub async fn endpoint() -> Result<iroh::Endpoint> {
-    for _ in 0..750 {
-        if let Some(outcome) = ENDPOINT.with(|cell| cell.borrow().clone()) {
-            return outcome;
+    let (attempt, pending) = ENDPOINT.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let generation = ATTEMPT.with(|counter| {
+                let next = counter.get().wrapping_add(1);
+                counter.set(next);
+                next
+            });
+            let bind = async move {
+                // The key is generated per page: nothing depends on a stable peer
+                // id (SSH authenticates the user), and nothing is written to storage.
+                let mut seed = [0u8; 32];
+                {
+                    use kereru::Randomness as _;
+                    platform::BrowserRng.fill(&mut seed);
+                }
+                iroh::Endpoint::builder(presets::N0)
+                    .secret_key(iroh::SecretKey::from_bytes(&seed))
+                    .bind()
+                    .await
+                    .map_err(|e| format!("could not start the browser's iroh endpoint: {e}"))
+            };
+            *slot = Some((generation, bind.boxed_local().shared()));
         }
-        if !BINDING.with(Cell::get) {
-            let binding = Binding;
-            BINDING.with(|flag| flag.set(true));
-            // The key is generated per page: nothing depends on a stable peer id
-            // (SSH authenticates the user), and nothing is written to storage.
-            let mut seed = [0u8; 32];
-            {
-                use kereru::Randomness as _;
-                platform::BrowserRng.fill(&mut seed);
-            }
-            let outcome = iroh::Endpoint::builder(presets::N0)
-                .secret_key(iroh::SecretKey::from_bytes(&seed))
-                .bind()
-                .await
-                .map_err(|e| format!("could not start the browser's iroh endpoint: {e}"));
-            ENDPOINT.with(|cell| *cell.borrow_mut() = Some(outcome.clone()));
-            drop(binding);
-            return outcome;
-        }
-        // Another caller is binding; give it 20ms and look again.
-        wasm_bindgen_futures::JsFuture::from(platform::sleep(20))
-            .await
-            .ok();
+        let (generation, future) = slot.as_ref().expect("just inserted");
+        (*generation, future.clone())
+    });
+
+    let outcome = pending.await;
+    if let Ok(endpoint) = &outcome {
+        BOUND.with(|cell| *cell.borrow_mut() = Some(endpoint.clone()));
     }
-    Err("the browser's iroh endpoint did not start".to_owned())
+    if outcome.is_err() {
+        ENDPOINT.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot
+                .as_ref()
+                .is_some_and(|(generation, _)| *generation == attempt)
+            {
+                *slot = None;
+            }
+        });
+    }
+    outcome
 }
 
 /// The id the roost sees for this page, if the endpoint is already up.
 pub fn endpoint_id() -> Option<String> {
-    ENDPOINT.with(|cell| {
+    BOUND.with(|cell| {
         cell.borrow()
             .as_ref()
-            .and_then(|outcome| outcome.as_ref().ok())
             .map(|endpoint| endpoint.id().to_string())
     })
 }

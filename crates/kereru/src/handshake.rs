@@ -27,12 +27,15 @@ mod msg {
     pub const USERAUTH_PK_OK: u8 = 60;
 }
 
-/// OpenSSH's "strict key exchange" pseudo-algorithm (the Terrapin mitigation).
+/// OpenSSH's "strict key exchange" pseudo-algorithms (the Terrapin mitigation).
 ///
-/// When both sides list it, a man-in-the-middle cannot inject packets around the
-/// key exchange, because every message is accounted for by the sequence numbers
-/// and those are reset to zero when the keys change.
-const STRICT_KEX: &str = "kex-strict-c-v00@openssh.com";
+/// Each side advertises its own marker and looks for the other's: a client sends
+/// `-c-` and requires `-s-` from the server. Comparing against our own marker
+/// would silently never match, leaving us non-strict while the server resets its
+/// sequence numbers after NEWKEYS — which corrupts any cipher that derives its
+/// nonce from the sequence number.
+const STRICT_KEX_CLIENT: &str = "kex-strict-c-v00@openssh.com";
+const STRICT_KEX_SERVER: &str = "kex-strict-s-v00@openssh.com";
 
 const KEX_ALGORITHMS: [&str; 2] = ["curve25519-sha256", "curve25519-sha256@libssh.org"];
 
@@ -67,7 +70,7 @@ fn build_kexinit(
     rng.fill(&mut cookie);
     Writer::message(msg::KEXINIT)
         .raw(&cookie)
-        .name_list(&[STRICT_KEX, KEX_ALGORITHMS[0], KEX_ALGORITHMS[1]])
+        .name_list(&[STRICT_KEX_CLIENT, KEX_ALGORITHMS[0], KEX_ALGORITHMS[1]])
         .name_list(host_keys)
         .name_list(ciphers)
         .name_list(ciphers)
@@ -189,7 +192,7 @@ pub(crate) async fn handshake<T: AsyncRead + AsyncWrite + Unpin>(
     // Strict key exchange, if the server offers it: the KEXINIT must have been the
     // first packet, nothing else may appear until NEWKEYS, and the sequence
     // numbers restart when the keys change.
-    let strict_kex = server.kex.iter().any(|name| name == STRICT_KEX);
+    let strict_kex = server.kex.iter().any(|name| name == STRICT_KEX_SERVER);
     if strict_kex && skipped_before_kexinit > 0 {
         return Err(Error::Protocol(
             "server sent packets before KEXINIT under strict key exchange".into(),

@@ -21,7 +21,6 @@ use crate::platform::{self, Result};
 
 const STORAGE_KEY: &str = "identity";
 
-/// PKCS#8 DER prefix for an Ed25519 private key; the 32-byte seed follows it.
 /// Which signature scheme the browser gave us.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Algorithm {

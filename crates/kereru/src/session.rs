@@ -337,6 +337,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Session<T> {
     }
 
     async fn flush_input(&mut self) -> Result<()> {
+        if self.close_sent {
+            // CHANNEL_CLOSE already went out, so anything still queued has
+            // nowhere to go and sending it would be a protocol violation.
+            self.pending_input.clear();
+            return Ok(());
+        }
         while !self.pending_input.is_empty() && self.remote_window > 0 {
             let take = self
                 .pending_input

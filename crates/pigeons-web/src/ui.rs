@@ -56,6 +56,11 @@ pub async fn run() -> Result<()> {
     wire(&app);
     app.borrow_mut().relayout();
     keyboard().focus().ok();
+    // Older builds stored an iroh key here; the key is per page load now, so the
+    // record is dead weight in the origin's storage.
+    wasm_bindgen_futures::spawn_local(async {
+        platform::idb_delete("iroh-endpoint-key").await.ok();
+    });
     update_chrome(&app);
     Ok(())
 }
@@ -638,7 +643,8 @@ impl App {
                 if let Some(cancel) = self.dial_cancel.take() {
                     let _ = cancel.send(());
                 }
-                self.term.write("cancelled\n");
+                // The connect task reports the failure itself; saying it here too
+                // would print it twice.
             }
             None => self.term.write("not connected\n"),
         }
@@ -1044,6 +1050,19 @@ fn render_settings(app: &Rc<RefCell<App>>) {
                 };
                 let renamed = input.value().trim().to_owned();
                 if renamed.is_empty() || renamed == previous {
+                    input.set_value(&previous);
+                    return;
+                }
+                // Two hosts cannot share a name, or they would share a pinned key.
+                let taken = state
+                    .config
+                    .hosts
+                    .iter()
+                    .enumerate()
+                    .any(|(other, host)| other != index && host.name == renamed);
+                if taken {
+                    input.set_value(&previous);
+                    state.toast(&format!("another host is already called {renamed}"));
                     return;
                 }
                 if let Some(host) = state.config.hosts.get_mut(index) {

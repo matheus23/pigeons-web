@@ -24,6 +24,17 @@ const ANSI: [&str; 16] = [
 
 const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
+/// The emulator's grid size.
+///
+/// A struct rather than a `(u16, u16)` tuple: `vt100` reports `(rows, cols)` while
+/// `avt` reports `(cols, rows)`, and reading one as the other silently announces a
+/// transposed terminal to the remote shell, which only misbehaves on a real PTY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Size {
+    pub columns: u16,
+    pub rows: u16,
+}
+
 /// How many scrollback lines to keep.
 const SCROLLBACK: usize = 1000;
 
@@ -72,18 +83,22 @@ impl Terminal {
         terminal
     }
 
-    /// The emulator's size as (columns, rows).
-    pub fn size(&self) -> (u16, u16) {
+    /// The emulator's grid size.
+    pub fn size(&self) -> Size {
         let (columns, rows) = self.vt.size();
-        (columns as u16, rows as u16)
+        Size {
+            columns: columns as u16,
+            rows: rows as u16,
+        }
     }
 
     /// Resizes the screen to the viewport. Returns the new size if it changed.
-    pub fn fit(&mut self) -> Option<(u16, u16)> {
+    pub fn fit(&mut self) -> Option<Size> {
         let rect = self.viewport.get_bounding_client_rect();
         let columns = ((rect.width() / self.cell_w).floor() as u16).clamp(20, 400);
         let rows = ((rect.height() / self.cell_h).floor() as u16).clamp(6, 200);
-        if (columns, rows) == self.size() {
+        let size = Size { columns, rows };
+        if size == self.size() {
             return None;
         }
 
@@ -127,7 +142,7 @@ impl Terminal {
             self.grid.append_child(&row).ok();
             self.rows.push(row);
         }
-        Some((columns, rows))
+        Some(size)
     }
 
     /// Enables or disables newline translation for received bytes.
@@ -221,9 +236,9 @@ impl Terminal {
     }
 
     pub fn clear(&mut self) {
-        let (columns, rows) = self.size();
+        let size = self.size();
         self.vt = Vt::builder()
-            .size(columns as usize, rows as usize)
+            .size(size.columns as usize, size.rows as usize)
             .scrollback_limit(SCROLLBACK)
             .build();
         self.painted.clear();

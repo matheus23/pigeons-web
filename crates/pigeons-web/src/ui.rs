@@ -274,10 +274,12 @@ impl App {
                 // Copy what the remote actually sent, for reporting a render bug.
                 "b" => {
                     event.prevent_default();
-                    let (columns, rows) = self.term.size();
+                    let size = self.term.size();
                     let (cursor_row, cursor_column) = self.term.cursor_cell();
                     let dump = format!(
-                        "# {columns}x{rows} cursor=({cursor_row},{cursor_column})\n{}\n",
+                        "# {}x{} cursor=({cursor_row},{cursor_column})\n{}\n",
+                        size.columns,
+                        size.rows,
                         self.term.received_dump()
                     );
                     platform::log(&dump);
@@ -398,12 +400,12 @@ impl App {
 
     fn relayout(&mut self) {
         self.fit_viewport();
-        if let Some((columns, rows)) = self.term.fit()
+        if let Some(size) = self.term.fit()
             && let Some(session) = &self.session
         {
             let _ = session.input.send(Input::Resize {
-                columns: columns as u32,
-                rows: rows as u32,
+                columns: size.columns as u32,
+                rows: size.rows as u32,
             });
         }
         // The status bar wording depends on the width, so a rotation or a
@@ -767,14 +769,10 @@ async fn connect(
     command: Option<String>,
     roost: String,
 ) {
-    let (known, columns, rows) = {
+    let (known, size) = {
         let state = app.borrow();
-        let (columns, rows) = state.term.size();
-        (
-            state.config.known_hosts.get(&host.name).cloned(),
-            columns,
-            rows,
-        )
+        let size = state.term.size();
+        (state.config.known_hosts.get(&host.name).cloned(), size)
     };
     let identity = app.borrow().identity.clone();
 
@@ -784,8 +782,8 @@ async fn connect(
         let config = ClientConfig {
             user,
             terminal: "xterm-256color".into(),
-            columns: columns as u32,
-            rows: rows as u32,
+            columns: size.columns as u32,
+            rows: size.rows as u32,
             command,
             request_pty: true,
             ..ClientConfig::default()

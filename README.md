@@ -92,11 +92,17 @@ stream.
   events (so phone keyboards and IME work), while `keydown` handles only control
   keys. The layout follows `visualViewport`, so an open keyboard shrinks the
   terminal instead of hiding the cursor, and the resize is passed to the remote.
-- **Gestures**: a tap focuses (and returns to the live screen); a drag scrolls, so
-  a scroll gesture never reopens the keyboard. Where the drag scrolls depends on
-  the program: our history for a shell, cursor keys for a full-screen program
-  that is on the alternate screen, and mouse wheel reports for one that asked for
-  them — the same split xterm, VTE, Alacritty, tmux and Windows Terminal make.
+- **Scrolling is the browser's.** The viewport is a real scroll container whose
+  extent is the scrollback, so panning, wheel, trackpad, momentum, the scroll
+  API and the page's own gesture handling all behave as they do everywhere else.
+  The visible window is painted from the scroll position, with the grid stuck to
+  the top of the scroller.
+- **Gestures**: a tap focuses and returns to the live screen; a drag pans, and
+  never reopens the keyboard. When a program owns the screen — a full-screen app
+  on the alternate screen, or one that asked for mouse reports — the browser is
+  taken out of it and a drag is translated instead: cursor keys for a pager,
+  wheel reports for a program that wants the mouse, the same split xterm, VTE,
+  Alacritty, tmux and Windows Terminal make.
 - **Extra keys**: touch devices get a row for `esc`, `tab`, a sticky `ctrl`, and
   the four arrows, because a phone keyboard has none of them.
 - **Storage**: hosts and trusted host keys are JSON in `localStorage` — the
@@ -198,11 +204,12 @@ Ed25519, and behaviour when the relay is unreachable.
 - **Browser connections are relay-only.** No hole punching: everything goes
   through a relay, which is fine for a shell and not great for bulk transfer.
 - **Scrolling follows whoever owns the screen.** A drag or the wheel moves the
-  page's own history (1000 lines) on a normal screen; on the alternate screen the
-  gesture becomes Up/Down for the program, unless that program asked for mouse
-  reports, in which case it gets wheel events. `PageUp` still goes to the
-  application, and there is no scrollbar — only a "how far back" badge that
-  returns you to the bottom.
+  page's own history (1000 lines) on a normal screen, through the browser's own
+  scroller; on the alternate screen the gesture becomes Up/Down for the program,
+  unless that program asked for mouse reports, in which case it gets wheel
+  events. `PageUp` still goes to the application. The scrollbar is hidden so the
+  column count cannot change when history appears; a "how far back" badge returns
+  you to the bottom instead.
 - **The SSH key is per origin.** It lives in that origin's IndexedDB, so moving
   the deployment to another host or port means trusting a new key on the server.
 - **No rekeying.** Fine for a session, not for a multi-gigabyte transfer.

@@ -46,14 +46,21 @@
 
       <main class="terminal" id="terminal">
         <div class="viewport" id="viewport">
-          <div class="grid" id="grid">
-            <span id="probe" class="probe">MMMMMMMMMMMMMMMMMMMM</span>
+          <!-- The scroller is as tall as the whole scrollback and the grid is
+               stuck to its top; the browser owns the scroll position, so drags,
+               wheels, momentum and scrollbars all behave natively. -->
+          <div class="scroller" id="scroller">
+            <div class="grid" id="grid">
+              <span id="probe" class="probe">MMMMMMMMMMMMMMMMMMMM</span>
+              <!-- Inside the sticky grid, so it stays aligned with the rows
+                   whether or not the viewport is scrolled. -->
+              <div class="cursor" id="cursor"></div>
+            </div>
           </div>
-          <div class="cursor" id="cursor"></div>
-          <!-- Only shown while the view is scrolled back; tapping returns to the
-               live screen. -->
-          <button id="scroll-back" class="scroll-back" aria-label="back to the newest output"></button>
         </div>
+        <!-- Outside the scroll container: an absolutely positioned child of a
+             scrolling box travels with its content. -->
+        <button id="scroll-back" class="scroll-back" aria-label="back to the newest output"></button>
       </main>
 
       <!-- Esc, Tab, Ctrl and the arrows: a phone keyboard has none of them, and

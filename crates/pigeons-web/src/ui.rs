@@ -161,6 +161,16 @@ fn wire(app: &Rc<RefCell<App>>) {
         handle.borrow_mut().pointer = None;
     });
 
+    // The browser's own scrolling: panning, wheel, momentum and the scroll API.
+    let handle = app.clone();
+    platform::on::<web_sys::Event>(
+        &platform::by_id::<HtmlElement>("viewport").into(),
+        "scroll",
+        move |_| {
+            handle.borrow_mut().term.on_scroll();
+        },
+    );
+
     // Wheel and trackpads scroll the same history on a desktop.
     let handle = app.clone();
     platform::on::<web_sys::WheelEvent>(&surface, "wheel", move |event| {
@@ -309,10 +319,6 @@ impl App {
 
     /// Records where a gesture began; nothing is focused until it ends as a tap.
     fn pointer_down(&mut self, event: web_sys::PointerEvent) {
-        // Suppressing the default stops the compatibility mouse events that
-        // follow a touch. Their mousedown moves focus to the body, which blurs
-        // the input and closes the keyboard the instant it opened.
-        event.prevent_default();
         self.track_pointer(&event);
         self.pointer = Some(Gesture {
             start_y: event.client_y() as f64,
@@ -326,6 +332,10 @@ impl App {
     fn pointer_move(&mut self, event: web_sys::PointerEvent) {
         self.track_pointer(&event);
         let cell = self.term.cell_height();
+        // Only a program that took the screen needs the drag translated. In every
+        // other case the browser pans the scroller itself, with its own momentum
+        // and overscroll, and the viewport's scroll event repaints the window.
+        let translate = self.program_owns_scroll();
         let Some(gesture) = self.pointer.as_mut() else {
             return;
         };
@@ -336,6 +346,9 @@ impl App {
         }
         gesture.last_y = y;
         gesture.moved += delta.abs();
+        if !translate {
+            return;
+        }
         // Phone events arrive a few pixels apart, so the delta nearly always
         // falls short of a cell. Carry the fraction instead of rounding each
         // event away, or a slow drag does nothing at all.
@@ -363,6 +376,11 @@ impl App {
 
     /// Wheel and trackpad scrolling.
     fn on_wheel(&mut self, event: web_sys::WheelEvent) {
+        // A program that owns the screen gets the wheel as keys or mouse reports;
+        // otherwise the browser scrolls the scroller and we repaint on scroll.
+        if !self.program_owns_scroll() {
+            return;
+        }
         event.prevent_default();
         let cell = self.term.cell_height();
         let rows = match event.delta_mode() {
@@ -410,6 +428,11 @@ impl App {
             return;
         }
         self.term.scroll_by(rows);
+    }
+
+    /// Whether the program owns scrolling, rather than the browser.
+    fn program_owns_scroll(&self) -> bool {
+        self.term.wants_mouse() || (self.term.alternate_screen() && self.term.alternate_scroll())
     }
 
     /// The cursor key a scroll means for a program that owns the screen.

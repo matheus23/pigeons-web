@@ -191,6 +191,7 @@ button.wide {
 /* ---------------------------------------------------------------- terminal */
 
 .terminal {
+  position: relative;
   flex: 1;
   min-height: 0;
   padding: 14px 16px 10px;
@@ -199,10 +200,39 @@ button.wide {
 .viewport {
   position: relative;
   height: 100%;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  /* No scroll chaining: dragging past the end must not move the page. */
+  overscroll-behavior: contain;
+  /* Vertical panning is the browser's job; the program's gestures take over
+     with .program below. */
+  touch-action: pan-y;
+  /* The grid is measured against this box, so the scrollbar must not change its
+     width when history appears. */
+  scrollbar-width: none;
 }
 
+.viewport::-webkit-scrollbar {
+  display: none;
+}
+
+/* A program that owns the screen (a pager, an editor, anything tracking the
+   mouse) gets no native scrolling and no panning. */
+.viewport.program {
+  overflow: hidden;
+  touch-action: none;
+}
+
+/* The scroll extent; its height is set from the history size. */
+.scroller {
+  position: relative;
+}
+
+/* Stuck to the top of the scroller: we repaint it for the row the browser is
+   showing, so only a screenful of rows exists in the DOM. */
 .grid {
+  position: sticky;
+  top: 0;
   --cell-w: 8.4px;
   --cell-h: 18px;
   font-family: var(--mono);
@@ -536,7 +566,6 @@ body {
 }
 
 .terminal {
-  touch-action: manipulation;
   -webkit-user-select: none;
   user-select: none;
 }
@@ -549,12 +578,6 @@ body {
 }
 
 /* ------------------------------------------------------------ scrollback */
-
-/* Dragging is ours: the page itself cannot scroll, and letting the browser
-   claim the gesture cancels our pointer events mid-drag. */
-.terminal {
-  touch-action: none;
-}
 
 .scroll-back {
   position: absolute;

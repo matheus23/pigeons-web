@@ -57,6 +57,10 @@ pub struct Terminal {
     crlf: bool,
     /// Tail of what the remote sent, for the byte dump.
     received: std::collections::VecDeque<u8>,
+    /// The scroll extent the browser scrolls; its height is the history size.
+    scroller: HtmlElement,
+    /// Height last written to the scroller, so it is only written on change.
+    scroller_height: f64,
     /// How many lines the view is scrolled back from the bottom of history.
     scroll: usize,
     /// Shown while the view is not at the bottom; tapping it jumps back.
@@ -86,6 +90,8 @@ impl Terminal {
             pending_utf8: Vec::new(),
             crlf: false,
             received: std::collections::VecDeque::new(),
+            scroller: platform::by_id("scroller"),
+            scroller_height: 0.0,
             scroll: 0,
             scroll_back: platform::by_id("scroll-back"),
             modes: Modes::initial(),
@@ -353,6 +359,65 @@ impl Terminal {
         if self.scroll > furthest {
             self.scroll = furthest;
         }
+        self.sync_scroller(total, window);
+        self.paint(columns, rows, total);
+    }
+
+    /// Sizes the scroll extent to the history and puts the view where `scroll`
+    /// says, without touching a scroll position the browser already agrees with.
+    fn sync_scroller(&mut self, total: usize, window: usize) {
+        let height = total as f64 * self.cell_h;
+        if (self.scroller_height - height).abs() > 0.5 {
+            self.scroller
+                .style()
+                .set_property("height", &format!("{height}px"))
+                .ok();
+            self.scroller_height = height;
+        }
+        // A program that owns the screen has nothing to scroll, and its gestures
+        // belong to the browser only when it has not taken them.
+        let program = self.modes.alternate_screen || self.modes.mouse_tracking;
+        self.viewport.set_class_name(if program {
+            "viewport program"
+        } else {
+            "viewport"
+        });
+        let furthest = total.saturating_sub(window) as f64;
+        let top = (furthest - self.scroll as f64) * self.cell_h;
+        if (self.viewport.scroll_top() as f64 - top).abs() > 0.5 {
+            self.viewport.set_scroll_top(top.max(0.0) as i32);
+        }
+    }
+
+    /// Reads the scroll position the browser moved to, and repaints.
+    ///
+    /// The viewport's scroll event fires for native panning, wheel, momentum and
+    /// the scroll API alike, so this is what makes scrolling behave like the
+    /// rest of the page.
+    pub fn on_scroll(&mut self) {
+        let (columns, rows) = {
+            let (columns, rows) = self.vt.size();
+            (columns as u16, rows as u16)
+        };
+        let total = self.total_lines();
+        let window = rows as usize;
+        let furthest = total.saturating_sub(window) as f64;
+        let top = self.viewport.scroll_top() as f64;
+        let back = ((furthest * self.cell_h - top) / self.cell_h).round();
+        let back = back.clamp(0.0, furthest) as usize;
+        if back == self.scroll {
+            return;
+        }
+        self.scroll = back;
+        // Paint only: writing a scroll position here would fight the gesture
+        // that is still in progress.
+        self.paint(columns, rows, total);
+    }
+
+    /// Paints the rows of the window the view is showing.
+    fn paint(&mut self, columns: u16, rows: u16, total: usize) {
+        let window = rows as usize;
+        let furthest = total.saturating_sub(window);
         let start = furthest.saturating_sub(self.scroll);
 
         let mut painted: Vec<(String, Vec<Run>)> = Vec::with_capacity(window);

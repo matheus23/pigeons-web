@@ -151,6 +151,11 @@ fn wire(app: &Rc<RefCell<App>>) {
         handle.borrow_mut().pointer_up(event);
     });
 
+    platform::on::<web_sys::MouseEvent>(&surface, "mousedown", move |event| {
+        // Focus belongs to the input sink, not to whatever was tapped.
+        event.prevent_default();
+    });
+
     let handle = app.clone();
     platform::on::<web_sys::PointerEvent>(&surface, "pointercancel", move |_| {
         handle.borrow_mut().pointer = None;
@@ -304,6 +309,10 @@ impl App {
 
     /// Records where a gesture began; nothing is focused until it ends as a tap.
     fn pointer_down(&mut self, event: web_sys::PointerEvent) {
+        // Suppressing the default stops the compatibility mouse events that
+        // follow a touch. Their mousedown moves focus to the body, which blurs
+        // the input and closes the keyboard the instant it opened.
+        event.prevent_default();
         self.track_pointer(&event);
         self.pointer = Some(Gesture {
             start_y: event.client_y() as f64,

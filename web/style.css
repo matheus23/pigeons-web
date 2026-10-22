@@ -497,3 +497,53 @@ button.wide {
     border-bottom: 0;
   }
 }
+
+/* --------------------------------------------------------------- keyboard
+
+   The page has no visible text field, but a soft keyboard only appears for a
+   focused editable element. This is that element: 1x1, invisible, and out of
+   the way. Font size stays at 16px because iOS zooms the page when a field with
+   a smaller font is focused. */
+
+.keyboard {
+  position: fixed;
+  /* bottom rather than top: iOS scrolls to reveal a focused field, and a
+     field at the bottom is already above the keyboard. */
+  bottom: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+  font-size: 16px;
+  line-height: 1;
+  color: transparent;
+  background: transparent;
+  caret-color: transparent;
+  z-index: -1;
+}
+
+/* Mobile behaviour: no pull-to-refresh while reading output, no double-tap
+   zoom, and no accidental text selection when tapping the terminal. */
+body {
+  overscroll-behavior: none;
+}
+
+.terminal {
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* A phone has no Ctrl key; the keyboard hints are noise there. */
+@media (max-width: 700px) {
+  .statusbar .signature {
+    display: none;
+  }
+}

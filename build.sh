@@ -14,7 +14,19 @@ cargo build --target wasm32-unknown-unknown -p pigeons-web "${cargo_profile[@]}"
 
 rm -rf dist
 mkdir -p dist
-wasm-bindgen --target web --no-typescript \
+# The CLI must match the wasm-bindgen version pinned in crates/web/Cargo.toml.
+# It is often installed with cargo, which puts it in ~/.cargo/bin — not always
+# on PATH in a fresh shell.
+if command -v wasm-bindgen >/dev/null; then
+  bindgen=wasm-bindgen
+elif [ -x "$HOME/.cargo/bin/wasm-bindgen" ]; then
+  bindgen="$HOME/.cargo/bin/wasm-bindgen"
+else
+  echo "build.sh: wasm-bindgen not found (install it with: cargo install wasm-bindgen-cli --version 0.2.122)" >&2
+  exit 1
+fi
+
+"$bindgen" --target web --no-typescript \
   --out-dir dist/pkg \
   "target/wasm32-unknown-unknown/$profile_dir/pigeons_web.wasm"
 

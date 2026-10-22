@@ -53,6 +53,7 @@ pub async fn run() -> Result<()> {
         app.prompt();
     }
     wire(&app);
+    app.borrow_mut().relayout();
     update_chrome(&app);
     Ok(())
 }
@@ -107,14 +108,52 @@ fn wire(app: &Rc<RefCell<App>>) {
         handle.borrow_mut().on_paste(event);
     });
 
+    // A soft keyboard only opens for a focused editable element, so a tap on the
+    // terminal focuses the invisible textarea. Pointer events cover touch and
+    // mouse with one handler.
     let handle = app.clone();
-    platform::on::<web_sys::MouseEvent>(
+    platform::on::<web_sys::PointerEvent>(
         &platform::by_id::<HtmlElement>("terminal").into(),
-        "mousedown",
+        "pointerdown",
         move |_| {
             handle.borrow_mut().refocus();
         },
     );
+
+    // Fallback for browsers that do not deliver pointer events for touch.
+    let handle = app.clone();
+    platform::on::<web_sys::MouseEvent>(
+        &platform::by_id::<HtmlElement>("terminal").into(),
+        "click",
+        move |_| {
+            handle.borrow_mut().refocus();
+        },
+    );
+
+    // Everything the browser writes into the textarea: typing, IME results, and
+    // pastes that were not intercepted.
+    let field: web_sys::EventTarget = keyboard().into();
+    let handle = app.clone();
+    platform::on::<web_sys::Event>(&field, "input", move |_| {
+        handle.borrow_mut().on_input();
+    });
+    let handle = app.clone();
+    platform::on::<web_sys::Event>(&field, "compositionend", move |_| {
+        handle.borrow_mut().on_input();
+    });
+
+    // The visual viewport shrinks when a keyboard opens; the layout has to
+    // follow it or the prompt ends up hidden behind the keyboard.
+    if let Some(viewport) = platform::window().visual_viewport() {
+        let handle = app.clone();
+        platform::on::<web_sys::Event>(viewport.as_ref(), "resize", move |_| {
+            handle.borrow_mut().relayout();
+        });
+        let handle = app.clone();
+        platform::on::<web_sys::Event>(viewport.as_ref(), "scroll", move |_| {
+            handle.borrow_mut().relayout();
+        });
+    }
 
     let handle = app.clone();
     platform::on::<web_sys::MouseEvent>(
@@ -148,12 +187,54 @@ fn wire(app: &Rc<RefCell<App>>) {
 }
 
 impl App {
+    /// Focuses the invisible textarea, which is what raises a soft keyboard.
     fn refocus(&mut self) {
-        // Keydown is captured on the window, so there is nothing to focus; this
-        // exists so clicking the terminal dismisses an open sheet.
         if is_settings_open() {
             close_settings();
         }
+        keyboard().focus().ok();
+    }
+
+    /// Text from the textarea: typed characters, IME output, or a paste that
+    /// landed in it. This is the only path for printable input, so it has to
+    /// work for a hardware keyboard and a phone alike.
+    fn on_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        match &self.session {
+            Some(session) => {
+                let mut bytes = text.replace('\n', "\r").into_bytes();
+                if !session.pty {
+                    // No terminal line discipline to turn CR into LF.
+                    for byte in bytes.iter_mut() {
+                        if *byte == b'\r' {
+                            *byte = b'\n';
+                        }
+                    }
+                }
+                let _ = session.input.send(Input::Data(bytes));
+                self.refocus();
+            }
+            None => {
+                for c in text.chars().filter(|c| !c.is_control()) {
+                    self.line.push(c);
+                    self.term.write(&c.to_string());
+                }
+                self.refocus();
+            }
+        }
+    }
+
+    /// Drains the textarea after the browser put something in it.
+    fn on_input(&mut self) {
+        let field = keyboard();
+        let value = field.value();
+        if value.is_empty() {
+            return;
+        }
+        field.set_value("");
+        self.on_text(&value);
     }
 
     fn on_key(&mut self, event: KeyboardEvent) -> Option<Action> {
@@ -281,19 +362,9 @@ impl App {
                     self.line.clear();
                 }
             }
-            key => {
-                if ctrl || event.alt_key() || event.meta_key() {
-                    return None;
-                }
-                let mut chars = key.chars();
-                if let (Some(c), None) = (chars.next(), chars.next())
-                    && !c.is_control()
-                {
-                    event.prevent_default();
-                    self.line.push(c);
-                    self.term.write(&c.to_string());
-                }
-            }
+            // Printable characters are appended by the textarea's input event,
+            // not here, so that soft keyboards and IME work.
+            _ => {}
         }
         None
     }
@@ -325,6 +396,7 @@ impl App {
     }
 
     fn relayout(&mut self) {
+        self.fit_viewport();
         if let Some((columns, rows)) = self.term.fit()
             && let Some(session) = &self.session
         {
@@ -333,7 +405,39 @@ impl App {
                 rows: rows as u32,
             });
         }
+        // The status bar wording depends on the width, so a rotation or a
+        // keyboard opening has to refresh it too.
+        render_chrome(
+            self.session.as_ref().map(|session| session.label.as_str()),
+            self.busy,
+        );
         self.term.render();
+    }
+
+    /// Sizes the app to the visual viewport.
+    ///
+    /// On mobile the layout viewport can keep its height when a soft keyboard
+    /// opens, which leaves the last rows — and the cursor — underneath it.
+    fn fit_viewport(&self) {
+        let window = platform::window();
+        let height = window
+            .visual_viewport()
+            .map(|viewport| viewport.height())
+            .filter(|height| *height > 0.0)
+            .unwrap_or_else(|| {
+                window
+                    .inner_height()
+                    .unwrap_or_default()
+                    .as_f64()
+                    .unwrap_or(0.0)
+            });
+        if height <= 0.0 {
+            return;
+        }
+        let app: HtmlElement = platform::by_id("app");
+        app.style()
+            .set_property("height", &format!("{height}px"))
+            .ok();
     }
 
     // -----------------------------------------------------------------------
@@ -815,16 +919,38 @@ fn render_chrome(label: Option<&str>, busy: bool) {
     let name: HtmlElement = platform::by_id("session-name");
     let hint: HtmlElement = platform::by_id("hint");
 
+    // Shortcut hints are meaningless on a phone, and they wrap badly in a
+    // narrow status bar.
+    let narrow = platform::window()
+        .inner_width()
+        .unwrap_or_default()
+        .as_f64()
+        .is_some_and(|width| width < 700.0);
+
     match label {
         Some(label) => {
             pill.set_class_name("pill connected");
             platform::set_text(&name, label);
-            platform::set_text(&hint, "Ctrl+Shift+D disconnects · Ctrl+Shift+C copies");
+            platform::set_text(
+                &hint,
+                if narrow {
+                    "tap the terminal to type"
+                } else {
+                    "Ctrl+Shift+D disconnects · Ctrl+Shift+C copies"
+                },
+            );
         }
         None => {
             pill.set_class_name("pill");
             platform::set_text(&name, if busy { "connecting" } else { "local" });
-            platform::set_text(&hint, "ssh <host> to connect · Ctrl+Shift+` for settings");
+            platform::set_text(
+                &hint,
+                if narrow {
+                    "tap to type · settings for hosts"
+                } else {
+                    "ssh <host> to connect · Ctrl+Shift+` for settings"
+                },
+            );
         }
     }
 }
@@ -1097,14 +1223,14 @@ fn is_form_target(event: &KeyboardEvent) -> bool {
 }
 
 fn is_form_target_event(target: Option<web_sys::EventTarget>) -> bool {
-    let Some(target) = target else {
+    let Some(element) = target.and_then(|target| target.dyn_into::<web_sys::Element>().ok()) else {
         return false;
     };
-    let tag = target
-        .dyn_ref::<web_sys::Element>()
-        .map(|element| element.tag_name())
-        .unwrap_or_default();
-    matches!(tag.as_str(), "INPUT" | "TEXTAREA" | "SELECT")
+    // The terminal's own textarea is where keys are supposed to land.
+    if element.id() == "keyboard" {
+        return false;
+    }
+    matches!(element.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT")
 }
 
 fn shorten(text: &str, limit: usize) -> String {
@@ -1173,4 +1299,9 @@ fn spawn_spinner(app: Rc<RefCell<App>>, generation: u32) {
                 .ok();
         }
     });
+}
+
+/// The invisible textarea that holds keyboard focus.
+fn keyboard() -> web_sys::HtmlTextAreaElement {
+    platform::by_id("keyboard")
 }

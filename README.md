@@ -81,6 +81,11 @@ stream.
 - **Identity**: an Ed25519 key imported as non-extractable PKCS#8 into WebCrypto;
   the public half is derived locally so the page can show the `authorized_keys`
   line. P-256 is the fallback if a browser lacks WebCrypto Ed25519.
+- **Input**: an invisible `textarea` holds focus, because that is the only thing
+  a soft keyboard opens for; characters arrive through `input` and composition
+  events (so phone keyboards and IME work), while `keydown` handles only control
+  keys. The layout follows `visualViewport`, so an open keyboard shrinks the
+  terminal instead of hiding the cursor, and the resize is passed to the remote.
 - **Storage**: hosts and trusted host keys are JSON in `localStorage` — the
   `~/.ssh/config` equivalent. The key lives in `IndexedDB`, because a `CryptoKey`
   is not a string.

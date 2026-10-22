@@ -498,13 +498,15 @@ pub fn encode_key(event: &KeyboardEvent, application_cursor: bool) -> Option<Vec
             } else if meta {
                 // Command on macOS belongs to the browser, not the shell.
                 return None;
-            } else if key.chars().count() == 1 {
-                let mut bytes = key.as_bytes().to_vec();
-                if alt {
-                    bytes.insert(0, 0x1b);
-                }
+            } else if alt && key.chars().count() == 1 {
+                // Alt+key never arrives as text, so send it as ESC + character.
+                let mut bytes = vec![0x1b];
+                bytes.extend_from_slice(key.as_bytes());
                 bytes
             } else {
+                // Plain text is not sent from here: it goes through the
+                // textarea's input event, which is the only path that also
+                // works for soft keyboards and IME composition.
                 return None;
             }
         }

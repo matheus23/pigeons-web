@@ -2,7 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
+    />
     <title>pigeons-web</title>
     <meta name="description" content="ssh in your browser, carried over iroh" />
     <meta name="color-scheme" content="dark" />
@@ -13,7 +16,7 @@
     />
   </head>
   <body>
-    <div class="app">
+    <div class="app" id="app">
       <header class="topbar">
         <div class="brand">
           <span class="mark" aria-hidden="true">🕊</span>
@@ -61,6 +64,21 @@
         <div class="sheet-body" id="settings-body"></div>
       </div>
     </div>
+
+    <!-- The terminal has no editable element of its own, so this holds focus:
+         a soft keyboard only opens for a focused editable, and mobile
+         keyboards report characters through input events rather than keydown. -->
+    <textarea
+      id="keyboard"
+      class="keyboard"
+      aria-label="terminal input"
+      autocomplete="off"
+      autocorrect="off"
+      autocapitalize="off"
+      spellcheck="false"
+      enterkeyhint="send"
+      rows="1"
+    ></textarea>
 
     <div class="toast" id="toast"></div>
     <div class="boot-error" id="boot-error"></div>

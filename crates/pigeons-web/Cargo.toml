@@ -67,6 +67,7 @@ features = [
   "Navigator",
   "console",
   "Node",
+  "PointerEvent",
   "ResizeObserver",
   "ResizeObserverBoxOptions",
   "ResizeObserverEntry",
@@ -74,5 +75,6 @@ features = [
   "Storage",
   "SubtleCrypto",
   "Text",
+  "VisualViewport",
   "Window",
 ]

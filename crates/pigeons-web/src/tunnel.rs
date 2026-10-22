@@ -8,13 +8,12 @@
 //!
 //! The stream is then handed to the SSH client as an ordinary byte stream.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use wasm_bindgen::JsValue;
 
 use crate::platform;
 use crate::platform::Result;
@@ -22,49 +21,58 @@ use crate::platform::Result;
 /// The ALPN a `pigeons` roost accepts; one stream is one SSH connection.
 const PIGEONS_ALPN: &[u8] = b"/pigeons/0";
 
-/// Where the page's iroh key lives, so the roost sees a stable peer id.
-const ENDPOINT_KEY: &str = "iroh-endpoint-key";
-
 thread_local! {
-    /// One endpoint per page, bound on first use.
-    static ENDPOINT: RefCell<Option<iroh::Endpoint>> = const { RefCell::new(None) };
+    /// The endpoint, or the reason binding it failed, so concurrent callers
+    /// share one outcome instead of each binding their own.
+    static ENDPOINT: RefCell<Option<Result<iroh::Endpoint>>> = const { RefCell::new(None) };
+    /// True while one caller is inside `bind()`.
+    static BINDING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The page's iroh key, generated once and kept in IndexedDB.
+/// Clears the binding flag however the bind ends, including cancellation.
+struct Binding;
+
+impl Drop for Binding {
+    fn drop(&mut self) {
+        BINDING.with(|flag| flag.set(false));
+    }
+}
+
+/// The page's iroh endpoint, bound on first use.
 ///
-/// Without this a reload would be a new peer id, which makes roost-side logs and
-/// any future endpoint-id authorisation useless.
-async fn endpoint_secret() -> Result<iroh::SecretKey> {
-    if let Ok(Some(stored)) = platform::idb_get(ENDPOINT_KEY).await
-        && let Ok(bytes) = platform::bytes_of(stored)
-        && let Ok(array) = <[u8; 32]>::try_from(bytes.as_slice())
-    {
-        return Ok(iroh::SecretKey::from_bytes(&array));
-    }
-
-    let mut bytes = [0u8; 32];
-    {
-        use kereru::Randomness as _;
-        platform::BrowserRng.fill(&mut bytes);
-    }
-    let key = iroh::SecretKey::from_bytes(&bytes);
-    let value = JsValue::from(js_sys::Uint8Array::from(&bytes[..]));
-    let _ = platform::idb_put(ENDPOINT_KEY, &value).await;
-    Ok(key)
-}
-
-/// The page's iroh endpoint, binding it on first use.
+/// Two callers can arrive before either has finished binding, so the first takes
+/// the flag and the others wait for its outcome; otherwise each would bind a
+/// separate endpoint with a separate key.
 pub async fn endpoint() -> Result<iroh::Endpoint> {
-    if let Some(endpoint) = ENDPOINT.with(|cell| cell.borrow().clone()) {
-        return Ok(endpoint);
+    for _ in 0..750 {
+        if let Some(outcome) = ENDPOINT.with(|cell| cell.borrow().clone()) {
+            return outcome;
+        }
+        if !BINDING.with(Cell::get) {
+            let binding = Binding;
+            BINDING.with(|flag| flag.set(true));
+            // The key is generated per page: nothing depends on a stable peer id
+            // (SSH authenticates the user), and nothing is written to storage.
+            let mut seed = [0u8; 32];
+            {
+                use kereru::Randomness as _;
+                platform::BrowserRng.fill(&mut seed);
+            }
+            let outcome = iroh::Endpoint::builder(presets::N0)
+                .secret_key(iroh::SecretKey::from_bytes(&seed))
+                .bind()
+                .await
+                .map_err(|e| format!("could not start the browser's iroh endpoint: {e}"));
+            ENDPOINT.with(|cell| *cell.borrow_mut() = Some(outcome.clone()));
+            drop(binding);
+            return outcome;
+        }
+        // Another caller is binding; give it 20ms and look again.
+        wasm_bindgen_futures::JsFuture::from(platform::sleep(20))
+            .await
+            .ok();
     }
-    let endpoint = iroh::Endpoint::builder(presets::N0)
-        .secret_key(endpoint_secret().await?)
-        .bind()
-        .await
-        .map_err(|e| format!("could not start the browser's iroh endpoint: {e}"))?;
-    ENDPOINT.with(|cell| *cell.borrow_mut() = Some(endpoint.clone()));
-    Ok(endpoint)
+    Err("the browser's iroh endpoint did not start".to_owned())
 }
 
 /// The id the roost sees for this page, if the endpoint is already up.
@@ -72,6 +80,7 @@ pub fn endpoint_id() -> Option<String> {
     ENDPOINT.with(|cell| {
         cell.borrow()
             .as_ref()
+            .and_then(|outcome| outcome.as_ref().ok())
             .map(|endpoint| endpoint.id().to_string())
     })
 }

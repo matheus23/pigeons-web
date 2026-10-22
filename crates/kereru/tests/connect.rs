@@ -136,10 +136,9 @@ async fn drive(
 }
 
 #[tokio::test]
+#[ignore = "needs KERERU_TEST_SSH pointing at a test server"]
 async fn runs_a_one_shot_command() {
-    let Some(address) = server() else {
-        return;
-    };
+    let address = server().expect("KERERU_TEST_SSH must be set when this test runs");
     let stream = TcpStream::connect(&address).await.expect("connect");
     let mut session = kereru::connect(
         stream,
@@ -167,10 +166,9 @@ async fn runs_a_one_shot_command() {
 }
 
 #[tokio::test]
+#[ignore = "needs KERERU_TEST_SSH pointing at a test server"]
 async fn sends_input_and_eof_to_a_command() {
-    let Some(address) = server() else {
-        return;
-    };
+    let address = server().expect("KERERU_TEST_SSH must be set when this test runs");
     let stream = TcpStream::connect(&address).await.expect("connect");
     let mut session = kereru::connect(
         stream,
@@ -194,10 +192,9 @@ async fn sends_input_and_eof_to_a_command() {
 }
 
 #[tokio::test]
+#[ignore = "needs KERERU_TEST_SSH pointing at a test server"]
 async fn runs_an_interactive_shell_on_a_pty() {
-    let Some(address) = server() else {
-        return;
-    };
+    let address = server().expect("KERERU_TEST_SSH must be set when this test runs");
     let stream = TcpStream::connect(&address).await.expect("connect");
     let mut session = kereru::connect(
         stream,
@@ -243,10 +240,9 @@ async fn runs_an_interactive_shell_on_a_pty() {
 }
 
 #[tokio::test]
+#[ignore = "needs KERERU_TEST_SSH pointing at a test server"]
 async fn a_terminal_resize_reaches_the_shell() {
-    let Some(address) = server() else {
-        return;
-    };
+    let address = server().expect("KERERU_TEST_SSH must be set when this test runs");
     let stream = TcpStream::connect(&address).await.expect("connect");
     let mut session = kereru::connect(
         stream,
@@ -291,10 +287,9 @@ async fn a_terminal_resize_reaches_the_shell() {
 }
 
 #[tokio::test]
+#[ignore = "needs KERERU_TEST_SSH pointing at a test server"]
 async fn a_rejected_host_key_aborts_the_connection() {
-    let Some(address) = server() else {
-        return;
-    };
+    let address = server().expect("KERERU_TEST_SSH must be set when this test runs");
     let stream = TcpStream::connect(&address).await.expect("connect");
     let error = kereru::connect(
         stream,

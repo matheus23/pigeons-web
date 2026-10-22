@@ -45,6 +45,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
         &mut *self.rng
     }
 
+    /// Restarts outgoing sequence numbering, which strict key exchange requires
+    /// after NEWKEYS so no packet can be injected or replayed across a rekey.
+    pub fn reset_out_sequence(&mut self) {
+        self.seq_out = 0;
+    }
+
+    /// Restarts incoming sequence numbering, see [`reset_out_sequence`].
+    pub fn reset_in_sequence(&mut self) {
+        self.seq_in = 0;
+    }
+
     pub fn set_out_cipher(&mut self, cipher: Cipher) {
         self.out_cipher = Some(cipher);
     }
@@ -134,7 +145,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
             .len()
             .checked_sub(pad as usize)
             .ok_or_else(|| Error::Protocol(format!("padding of {} bytes exceeds packet", pad)))?;
-        Ok(Some(rest[..end].to_vec()))
+        let payload = rest[..end].to_vec();
+        if payload.is_empty() {
+            // Every packet starts with a message number, so an empty payload is
+            // malformed; indexing it further down would abort the page.
+            return Err(Error::Protocol("empty packet payload".into()));
+        }
+        Ok(Some(payload))
     }
 
     /// Waits for the next packet, reading from the transport as needed.

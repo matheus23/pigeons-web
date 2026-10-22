@@ -42,5 +42,5 @@ if command -v node >/dev/null; then
   node dev/check-wasm.mjs dist/pkg/pigeons_web_bg.wasm
 fi
 
-cp web/index.html web/style.css dist/
+cp web/index.html web/style.css web/boot.js dist/
 printf 'built dist/ (%s)\n' "$(du -sh dist | cut -f1)"

@@ -20,6 +20,7 @@ const MAX_CHANNEL_PACKET: u32 = 32 * 1024;
 /// Re-advertise the window once half of it has been consumed.
 const WINDOW_THRESHOLD: u32 = LOCAL_WINDOW / 2;
 
+const KEXINIT: u8 = 20;
 const DISCONNECT: u8 = 1;
 const IGNORE: u8 = 2;
 const UNIMPLEMENTED: u8 = 3;
@@ -54,6 +55,9 @@ pub enum Input {
     },
     /// No more input will be sent; the server is told the channel's input ended.
     Eof,
+    /// Closes the channel outright. A program that ignores EOF (a pager, a
+    /// full-screen editor) would otherwise keep the session alive.
+    Close,
 }
 
 /// Something the server sent that the local side should react to.
@@ -238,6 +242,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Session<T> {
     async fn handle_packet(&mut self, packet: &[u8]) -> Result<()> {
         let mut r = Reader::new(packet.get(1..).unwrap_or(&[]));
         match packet[0] {
+            KEXINIT => {
+                return Err(Error::Unsupported(
+                    "the server asked to rekey mid-session; reconnect".into(),
+                ));
+            }
             DISCONNECT => return Err(disconnect(packet)),
             IGNORE | DEBUG | UNIMPLEMENTED | EXT_INFO | SERVICE_ACCEPT => {}
             GLOBAL_REQUEST => {
@@ -271,7 +280,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Session<T> {
             CHANNEL_CLOSE => {
                 if !self.close_sent {
                     self.conn
-                        .write_packet(&Writer::message(CHANNEL_CLOSE).u32(LOCAL_CHANNEL).into_vec())
+                        .write_packet(
+                            &Writer::message(CHANNEL_CLOSE)
+                                .u32(self.remote_channel)
+                                .into_vec(),
+                        )
                         .await?;
                     self.close_sent = true;
                 }
@@ -292,7 +305,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Session<T> {
                     self.conn
                         .write_packet(
                             &Writer::message(CHANNEL_FAILURE)
-                                .u32(LOCAL_CHANNEL)
+                                .u32(self.remote_channel)
                                 .into_vec(),
                         )
                         .await?;
@@ -316,7 +329,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Session<T> {
         self.conn
             .write_packet(
                 &Writer::message(CHANNEL_WINDOW_ADJUST)
-                    .u32(LOCAL_CHANNEL)
+                    .u32(self.remote_channel)
                     .u32(increment)
                     .into_vec(),
             )
@@ -377,6 +390,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Session<T> {
                     self.resize(columns, rows).await?;
                 }
                 Some(Some(Input::Eof)) | Some(None) => self.send_eof().await?,
+                Some(Some(Input::Close)) => self.close().await?,
                 None => {}
             }
         }
@@ -402,7 +416,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Session<T> {
         }
         self.eof_sent = true;
         self.conn
-            .write_packet(&Writer::message(CHANNEL_EOF).u32(LOCAL_CHANNEL).into_vec())
+            .write_packet(
+                &Writer::message(CHANNEL_EOF)
+                    .u32(self.remote_channel)
+                    .into_vec(),
+            )
             .await
     }
 
@@ -412,7 +430,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Session<T> {
         if !self.close_sent {
             self.close_sent = true;
             self.conn
-                .write_packet(&Writer::message(CHANNEL_CLOSE).u32(LOCAL_CHANNEL).into_vec())
+                .write_packet(
+                    &Writer::message(CHANNEL_CLOSE)
+                        .u32(self.remote_channel)
+                        .into_vec(),
+                )
                 .await?;
         }
         self.closed = true;
@@ -423,7 +445,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Session<T> {
         if !self.close_sent {
             self.close_sent = true;
             self.conn
-                .write_packet(&Writer::message(CHANNEL_CLOSE).u32(LOCAL_CHANNEL).into_vec())
+                .write_packet(
+                    &Writer::message(CHANNEL_CLOSE)
+                        .u32(self.remote_channel)
+                        .into_vec(),
+                )
                 .await?;
         }
         Ok(())

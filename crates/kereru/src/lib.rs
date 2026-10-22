@@ -132,9 +132,9 @@ impl Default for ClientConfig {
             request_pty: true,
             client_version: format!("SSH-2.0-Kereru_{}", env!("CARGO_PKG_VERSION")),
             ciphers: vec![
-                "chacha20-poly1305@openssh.com",
                 "aes256-gcm@openssh.com",
                 "aes128-gcm@openssh.com",
+                "chacha20-poly1305@openssh.com",
             ],
             host_key_algorithms: vec!["ssh-ed25519", "ecdsa-sha2-nistp256"],
         }

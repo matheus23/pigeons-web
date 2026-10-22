@@ -44,6 +44,7 @@ pub async fn run() -> Result<()> {
         history_position: None,
         busy: false,
         connect_generation: 0,
+        dial_cancel: None,
     }));
 
     app.borrow_mut().self_ref = Rc::downgrade(&app);
@@ -80,8 +81,10 @@ struct App {
     history: Vec<String>,
     history_position: Option<usize>,
     busy: bool,
-    /// Bumped when a connection attempt starts or ends, so a stale spinner stop s.
+    /// Bumped when a connection attempt starts or ends, so a stale spinner stops.
     connect_generation: u32,
+    /// Set while a dial is in flight, so `disconnect` can abandon it.
+    dial_cancel: Option<futures::channel::oneshot::Sender<()>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +389,7 @@ impl App {
         event.prevent_default();
         match &self.session {
             Some(session) => {
-                let bytes = terminal::encode_paste(&text, false);
+                let bytes = terminal::encode_paste(&text, self.term.bracketed_paste());
                 let _ = session.input.send(Input::Data(bytes));
             }
             None => {
@@ -625,8 +628,17 @@ impl App {
     fn disconnect(&mut self) {
         match &self.session {
             Some(session) => {
-                let _ = session.input.send(Input::Eof);
+                // CHANNEL_CLOSE rather than a bare EOF: a pager or full-screen
+                // program ignores EOF and would keep the session alive.
+                let _ = session.input.send(Input::Close);
                 self.term.write("\r\n");
+            }
+            None if self.busy => {
+                // Drop the dial in flight; iroh cancels the attempt with the future.
+                if let Some(cancel) = self.dial_cancel.take() {
+                    let _ = cancel.send(());
+                }
+                self.term.write("cancelled\n");
             }
             None => self.term.write("not connected\n"),
         }
@@ -776,7 +788,7 @@ async fn connect(
     };
     let identity = app.borrow().identity.clone();
 
-    let result = async {
+    let attempt = async {
         let stream = tunnel::connect(&roost).await?;
 
         let config = ClientConfig {
@@ -817,8 +829,15 @@ async fn connect(
         let summary = format!("{} · {}", session.server_version(), session.cipher());
         let pty = session.has_pty();
         Ok::<_, String>((session, fingerprint, summary, pty))
-    }
-    .await;
+    };
+    let (cancel, cancelled) = futures::channel::oneshot::channel::<()>();
+    app.borrow_mut().dial_cancel = Some(cancel);
+    futures::pin_mut!(attempt, cancelled);
+    let result = match futures::future::select(attempt, cancelled).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right((_, _)) => Err("cancelled".to_string()),
+    };
+    app.borrow_mut().dial_cancel = None;
 
     let (mut session, fingerprint, summary, pty) = match result {
         Ok(value) => value,
@@ -838,10 +857,10 @@ async fn connect(
     let (input, mut queue) = tokio::sync::mpsc::unbounded_channel();
     {
         let mut state = app.borrow_mut();
+        state.term.clear();
         if let Some(banners) = session.banners().first() {
             state.term.write(&format!("{DIM}{banners}{RESET}\n"));
         }
-        state.term.clear();
         state.term.set_crlf(!pty);
         let label = host.name.clone();
         state
@@ -1012,11 +1031,30 @@ fn render_settings(app: &Rc<RefCell<App>>) {
                 state.config.save();
             });
         };
-        field(&name, |host, value| {
-            if !value.is_empty() {
-                host.name = value;
-            }
-        });
+        // Renaming a host has to carry its pinned host key across, or the next
+        // connection would silently trust whatever key the server presents.
+        {
+            let app = app.clone();
+            let input = name.clone();
+            platform::on::<web_sys::Event>(&name.clone().into(), "change", move |_| {
+                let mut state = app.borrow_mut();
+                let Some(previous) = state.config.hosts.get(index).map(|host| host.name.clone())
+                else {
+                    return;
+                };
+                let renamed = input.value().trim().to_owned();
+                if renamed.is_empty() || renamed == previous {
+                    return;
+                }
+                if let Some(host) = state.config.hosts.get_mut(index) {
+                    host.name = renamed.clone();
+                }
+                if let Some(pin) = state.config.known_hosts.remove(&previous) {
+                    state.config.known_hosts.insert(renamed, pin);
+                }
+                state.config.save();
+            });
+        }
         field(&user, |host, value| host.user = value);
         field(&target, |host, value| host.target = value);
 

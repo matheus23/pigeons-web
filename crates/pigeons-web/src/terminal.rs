@@ -57,6 +57,10 @@ pub struct Terminal {
     crlf: bool,
     /// Tail of what the remote sent, for the byte dump.
     received: std::collections::VecDeque<u8>,
+    /// Bracketed paste mode (DECSET 2004), which the page has to honour itself.
+    bracketed_paste: bool,
+    /// Tail kept between chunks so a split 2004 sequence is still seen.
+    paste_tail: Vec<u8>,
 }
 
 impl Terminal {
@@ -78,6 +82,8 @@ impl Terminal {
             pending_utf8: Vec::new(),
             crlf: false,
             received: std::collections::VecDeque::new(),
+            bracketed_paste: false,
+            paste_tail: Vec::new(),
         };
         terminal.fit();
         terminal
@@ -223,10 +229,24 @@ impl Terminal {
         }
         self.pending_utf8 = pending[consumed..].to_vec();
 
+        self.track_bracketed_paste(&data);
         for ch in decoded.chars() {
             self.vt.feed(ch);
         }
         self.render();
+    }
+
+    /// Whether the remote asked for pastes to be wrapped in `CSI 200 ~`.
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    /// Watches the incoming bytes for the bracketed paste toggle.
+    ///
+    /// The emulator eats these sequences without exposing the mode, but the page has
+    /// to know: an unbracketed multi-line paste runs as soon as it arrives.
+    fn track_bracketed_paste(&mut self, data: &[u8]) {
+        scan_bracketed_paste(&mut self.bracketed_paste, &mut self.paste_tail, data);
     }
 
     /// Writes text with newline translation, for locally generated output.
@@ -463,6 +483,27 @@ fn measure_cell() -> (f64, f64) {
     (width, height)
 }
 
+/// Updates the bracketed-paste flag from the incoming bytes.
+///
+/// `tail` carries the last few bytes between calls, so a sequence split across
+/// two reads is still recognised.
+fn scan_bracketed_paste(enabled: &mut bool, tail: &mut Vec<u8>, data: &[u8]) {
+    const ON: &[u8] = b"\x1b[?2004h";
+    const OFF: &[u8] = b"\x1b[?2004l";
+
+    let mut scan = std::mem::take(tail);
+    scan.extend_from_slice(data);
+    for window in scan.windows(ON.len()) {
+        if window == ON {
+            *enabled = true;
+        } else if window == OFF {
+            *enabled = false;
+        }
+    }
+    let keep = (ON.len() - 1).min(scan.len());
+    *tail = scan[scan.len() - keep..].to_vec();
+}
+
 /// Adds a carriage return before every line feed that lacks one.
 fn normalise_newlines(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + 16);
@@ -581,12 +622,42 @@ pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalise_newlines;
+    use super::{encode_paste, normalise_newlines, scan_bracketed_paste};
 
     #[test]
     fn newline_translation_adds_only_missing_carriage_returns() {
         assert_eq!(normalise_newlines(b"a\nb"), b"a\r\nb");
         assert_eq!(normalise_newlines(b"a\r\nb"), b"a\r\nb");
         assert_eq!(normalise_newlines(b"a\rb"), b"a\rb");
+    }
+    #[test]
+    fn bracketed_paste_follows_the_mode_the_server_set() {
+        let mut enabled = false;
+        let mut tail = Vec::new();
+        scan_bracketed_paste(&mut enabled, &mut tail, b"\x1b[?2004h");
+        assert!(enabled);
+        scan_bracketed_paste(&mut enabled, &mut tail, b"output \x1b[?2004l more");
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn bracketed_paste_toggle_split_across_reads_is_still_seen() {
+        let mut enabled = false;
+        let mut tail = Vec::new();
+        scan_bracketed_paste(&mut enabled, &mut tail, b"\x1b[?20");
+        assert!(!enabled);
+        scan_bracketed_paste(&mut enabled, &mut tail, b"04h");
+        assert!(enabled);
+    }
+
+    #[test]
+    fn a_paste_is_wrapped_only_when_the_mode_is_on() {
+        // Unbracketed: a multi-line paste runs line by line the moment it lands.
+        assert_eq!(encode_paste("one\ntwo", false), b"one\rtwo");
+        // Bracketed: the editor receives it as one block.
+        assert_eq!(
+            encode_paste("one\ntwo", true),
+            b"\x1b[200~one\rtwo\x1b[201~"
+        );
     }
 }

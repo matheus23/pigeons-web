@@ -9,6 +9,13 @@
     <title>pigeons-web</title>
     <meta name="description" content="ssh in your browser, carried over iroh" />
     <meta name="color-scheme" content="dark" />
+    <!-- Everything comes from this origin: the wasm bundle, the stylesheet, and
+         iroh's relay connections. Inline styles are the terminal's cell colours;
+         `wasm-unsafe-eval` is required to compile the module. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' wss: https:; base-uri 'none'; form-action 'none'"
+    />
     <link rel="stylesheet" href="style.css" />
     <link
       rel="icon"
@@ -83,13 +90,6 @@
     <div class="toast" id="toast"></div>
     <div class="boot-error" id="boot-error"></div>
 
-    <script type="module">
-      import init from "./pkg/pigeons_web.js";
-      init().catch((error) => {
-        const node = document.getElementById("boot-error");
-        node.className = "boot-error visible";
-        node.textContent = `could not start: ${error}`;
-      });
-    </script>
+    <script type="module" src="boot.js"></script>
   </body>
 </html>

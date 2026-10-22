@@ -27,6 +27,13 @@ mod msg {
     pub const USERAUTH_PK_OK: u8 = 60;
 }
 
+/// OpenSSH's "strict key exchange" pseudo-algorithm (the Terrapin mitigation).
+///
+/// When both sides list it, a man-in-the-middle cannot inject packets around the
+/// key exchange, because every message is accounted for by the sequence numbers
+/// and those are reset to zero when the keys change.
+const STRICT_KEX: &str = "kex-strict-c-v00@openssh.com";
+
 const KEX_ALGORITHMS: [&str; 2] = ["curve25519-sha256", "curve25519-sha256@libssh.org"];
 
 /// MACs are not used by the AEAD ciphers this client negotiates, but the
@@ -60,7 +67,7 @@ fn build_kexinit(
     rng.fill(&mut cookie);
     Writer::message(msg::KEXINIT)
         .raw(&cookie)
-        .name_list(&KEX_ALGORITHMS)
+        .name_list(&[STRICT_KEX, KEX_ALGORITHMS[0], KEX_ALGORITHMS[1]])
         .name_list(host_keys)
         .name_list(ciphers)
         .name_list(ciphers)
@@ -160,11 +167,15 @@ pub(crate) async fn handshake<T: AsyncRead + AsyncWrite + Unpin>(
     // 2. Algorithm negotiation.
     let i_c = build_kexinit(&cfg.ciphers, &cfg.host_key_algorithms, conn.rng());
     conn.write_packet(&i_c).await?;
+    let mut skipped_before_kexinit = 0;
     let i_s = loop {
         let packet = conn.read_packet().await?;
         match packet[0] {
             msg::KEXINIT => break packet,
-            msg::IGNORE | msg::DEBUG => continue,
+            msg::IGNORE | msg::DEBUG => {
+                skipped_before_kexinit += 1;
+                continue;
+            }
             msg::DISCONNECT => return Err(disconnect(&packet)),
             other => {
                 return Err(Error::Protocol(format!(
@@ -173,7 +184,17 @@ pub(crate) async fn handshake<T: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     };
+
     let server = parse_kexinit(&i_s)?;
+    // Strict key exchange, if the server offers it: the KEXINIT must have been the
+    // first packet, nothing else may appear until NEWKEYS, and the sequence
+    // numbers restart when the keys change.
+    let strict_kex = server.kex.iter().any(|name| name == STRICT_KEX);
+    if strict_kex && skipped_before_kexinit > 0 {
+        return Err(Error::Protocol(
+            "server sent packets before KEXINIT under strict key exchange".into(),
+        ));
+    }
 
     let kex_alg = negotiate("key exchange algorithm", &KEX_ALGORITHMS, &server.kex)?;
     let host_key_alg = negotiate(
@@ -212,7 +233,7 @@ pub(crate) async fn handshake<T: AsyncRead + AsyncWrite + Unpin>(
         let packet = conn.read_packet().await?;
         match packet[0] {
             msg::KEX_ECDH_REPLY => break packet,
-            msg::IGNORE | msg::DEBUG => continue,
+            msg::IGNORE | msg::DEBUG if !strict_kex => continue,
             msg::DISCONNECT => return Err(disconnect(&packet)),
             other => {
                 return Err(Error::Protocol(format!(
@@ -266,11 +287,14 @@ pub(crate) async fn handshake<T: AsyncRead + AsyncWrite + Unpin>(
 
     conn.write_packet(&[msg::NEWKEYS]).await?;
     conn.set_out_cipher(Cipher::new(kind_c2s, key_c2s, &iv_c2s));
+    if strict_kex {
+        conn.reset_out_sequence();
+    }
     loop {
         let packet = conn.read_packet().await?;
         match packet[0] {
             msg::NEWKEYS => break,
-            msg::IGNORE | msg::DEBUG => continue,
+            msg::IGNORE | msg::DEBUG if !strict_kex => continue,
             msg::DISCONNECT => return Err(disconnect(&packet)),
             other => {
                 return Err(Error::Protocol(format!(
@@ -280,6 +304,9 @@ pub(crate) async fn handshake<T: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     conn.set_in_cipher(Cipher::new(kind_s2c, key_s2c, &iv_s2c));
+    if strict_kex {
+        conn.reset_in_sequence();
+    }
 
     // 6. Authenticate with the first identity key the server accepts.
     conn.write_packet(

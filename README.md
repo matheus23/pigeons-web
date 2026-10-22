@@ -75,8 +75,10 @@ stream.
 - **Tunnel**: one iroh endpoint per page (`tunnel.rs`). The first connection binds
   it; later ones reuse it. The roost's stream is adapted to `AsyncRead`/
   `AsyncWrite` and handed straight to `kereru`.
-- **Terminal**: `vt100` for the screen model, painted as DOM rows. Only rows that
-  actually changed are rebuilt. 256-colour and truecolour, bold/italic/underline/
+- **Terminal**: [`avt`](https://github.com/asciinema/avt) (asciinema's virtual
+  terminal) owns the screen model — a complete emulator, which matters because a
+  shell editing a prompt that overflows the width uses insert mode and cursor
+  save/restore. Painted as DOM rows; only rows that changed are rebuilt. 256-colour and truecolour, bold/italic/underline/
   inverse, alternate screen, cursor state, window title.
 - **Identity**: an Ed25519 key imported as non-extractable PKCS#8 into WebCrypto;
   the public half is derived locally so the page can show the `authorized_keys`
@@ -182,7 +184,8 @@ Ed25519, and behaviour when the relay is unreachable.
   different endpoint.
 - **Browser connections are relay-only.** No hole punching: everything goes
   through a relay, which is fine for a shell and not great for bulk transfer.
-- **No scrollback.** The screen is the screen; `PageUp` goes to the application.
+- **No scrollback view.** The emulator keeps history, but only the visible screen
+  is painted, so `PageUp` goes to the application.
 - **The SSH key is per origin too.** Both the iroh key and the SSH key live in
   per-origin browser storage, so moving the deployment to another host or port
   means trusting a new key on the server.

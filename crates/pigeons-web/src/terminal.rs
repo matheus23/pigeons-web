@@ -1,9 +1,16 @@
 //! Terminal emulation and rendering.
 //!
-//! `vt100` turns the byte stream into a cell grid; this module paints that grid
-//! as DOM rows. A row is only rebuilt when its contents or styling change, so
-//! typing stays cheap while a screenful of output still repaints in one pass.
+//! `avt` (asciinema's virtual terminal) owns the screen model: escape parsing,
+//! insert/delete mode, scroll regions, charsets, wide characters, scrollback.
+//! It is a complete emulator rather than a subset, which matters here — a shell
+//! editing a prompt that overflows the width uses insert mode and save/restore,
+//! and a partial emulator mangles the line.
+//!
+//! This module paints the grid as DOM rows. A row is only rebuilt when its
+//! contents or styling change, so typing stays cheap while a screenful of output
+//! still repaints in one pass.
 
+use avt::{Color as AvtColor, Vt};
 use wasm_bindgen::JsCast;
 use web_sys::{HtmlElement, KeyboardEvent};
 
@@ -17,8 +24,11 @@ const ANSI: [&str; 16] = [
 
 const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
+/// How many scrollback lines to keep.
+const SCROLLBACK: usize = 1000;
+
 pub struct Terminal {
-    parser: vt100::Parser,
+    vt: Vt,
     viewport: HtmlElement,
     grid: HtmlElement,
     cursor: HtmlElement,
@@ -27,24 +37,25 @@ pub struct Terminal {
     painted: Vec<String>,
     cell_w: f64,
     cell_h: f64,
-    title: String,
     cursor_visible: bool,
-    /// Tail of what the remote sent, for the byte dump.
-    received: std::collections::VecDeque<u8>,
-    /// Trailing partial escape sequence, held back for the next chunk so a
-    /// sequence split across reads is still recognised as one.
-    pending_prefix: Vec<u8>,
+    /// Incomplete UTF-8 sequence from the previous chunk.
+    pending_utf8: Vec<u8>,
     /// Translate bare LF to CRLF. A session without a pseudo-terminal delivers
     /// plain newlines; a real terminal's line discipline would add the CR, and
     /// without it every line starts where the previous one ended.
     crlf: bool,
+    /// Tail of what the remote sent, for the byte dump.
+    received: std::collections::VecDeque<u8>,
 }
 
 impl Terminal {
     pub fn new(viewport: HtmlElement, grid: HtmlElement, cursor: HtmlElement) -> Self {
         let (cell_w, cell_h) = measure_cell();
         let mut terminal = Self {
-            parser: vt100::Parser::new(24, 80, 500),
+            vt: Vt::builder()
+                .size(80, 24)
+                .scrollback_limit(SCROLLBACK)
+                .build(),
             viewport,
             grid,
             cursor,
@@ -52,18 +63,19 @@ impl Terminal {
             painted: Vec::new(),
             cell_w,
             cell_h,
-            title: String::new(),
             cursor_visible: true,
-            received: std::collections::VecDeque::new(),
-            pending_prefix: Vec::new(),
+            pending_utf8: Vec::new(),
             crlf: false,
+            received: std::collections::VecDeque::new(),
         };
         terminal.fit();
         terminal
     }
 
+    /// The emulator's size as (columns, rows).
     pub fn size(&self) -> (u16, u16) {
-        self.parser.screen().size()
+        let (columns, rows) = self.vt.size();
+        (columns as u16, rows as u16)
     }
 
     /// Resizes the screen to the viewport. Returns the new size if it changed.
@@ -71,11 +83,11 @@ impl Terminal {
         let rect = self.viewport.get_bounding_client_rect();
         let columns = ((rect.width() / self.cell_w).floor() as u16).clamp(20, 400);
         let rows = ((rect.height() / self.cell_h).floor() as u16).clamp(6, 200);
-        if (columns, rows) == self.parser.screen().size() {
+        if (columns, rows) == self.size() {
             return None;
         }
 
-        self.parser.set_size(rows, columns);
+        self.vt.resize(columns as usize, rows as usize);
         self.grid
             .style()
             .set_property("--cell-w", &format!("{}px", self.cell_w))
@@ -109,6 +121,7 @@ impl Terminal {
             row.remove();
         }
         self.painted.clear();
+
         for _ in 0..rows {
             let row = platform::element("div", "row");
             self.grid.append_child(&row).ok();
@@ -143,27 +156,60 @@ impl Terminal {
         out
     }
 
+    /// The cursor cell the emulator currently reports, for diagnostics.
+    pub fn cursor_cell(&self) -> (u16, u16) {
+        let cursor = self.vt.cursor();
+        (cursor.row as u16, cursor.col as u16)
+    }
+
     pub fn process(&mut self, bytes: &[u8]) {
         self.received.extend(bytes);
         while self.received.len() > 8192 {
             self.received.pop_front();
         }
 
-        // Reassemble the stream, keeping any partial escape prefix for the next
-        // chunk so a sequence split across reads is still recognised.
-        let mut data = std::mem::take(&mut self.pending_prefix);
-        data.extend_from_slice(bytes);
-        let tail = escape_prefix_len(&data);
-        if tail > 0 {
-            self.pending_prefix = data.split_off(data.len() - tail);
-        }
-
-        let data = rewrite_save_restore(&data);
-        if self.crlf {
-            let fixed = normalise_newlines(&data);
-            self.parser.process(&fixed);
+        let data = if self.crlf {
+            normalise_newlines(bytes)
         } else {
-            self.parser.process(&data);
+            bytes.to_vec()
+        };
+
+        // Decode UTF-8 across chunk boundaries: a sequence may be split between
+        // two reads, and a truncated character must not be dropped.
+        let mut pending = std::mem::take(&mut self.pending_utf8);
+        pending.extend_from_slice(&data);
+        let mut decoded = String::new();
+        let mut consumed = 0;
+        loop {
+            match std::str::from_utf8(&pending[consumed..]) {
+                Ok(text) => {
+                    decoded.push_str(text);
+                    consumed = pending.len();
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    // The bytes up to the error are known good.
+                    if let Ok(text) = std::str::from_utf8(&pending[consumed..consumed + valid]) {
+                        decoded.push_str(text);
+                    }
+                    consumed += valid;
+                    match error.error_len() {
+                        // Genuinely invalid: replace it and carry on.
+                        Some(length) => {
+                            decoded.push('\u{fffd}');
+                            consumed += length;
+                        }
+                        // Incomplete sequence at the end: wait for the next chunk.
+                        None => break,
+                    }
+                }
+            }
+        }
+        self.pending_utf8 = pending[consumed..].to_vec();
+
+        for ch in decoded.chars() {
+            self.vt.feed(ch);
         }
         self.render();
     }
@@ -175,77 +221,84 @@ impl Terminal {
     }
 
     pub fn clear(&mut self) {
-        self.parser = vt100::Parser::new(self.size().0, self.size().1, 500);
+        let (columns, rows) = self.size();
+        self.vt = Vt::builder()
+            .size(columns as usize, rows as usize)
+            .scrollback_limit(SCROLLBACK)
+            .build();
         self.painted.clear();
     }
 
     /// Plain text of the visible screen, used for copying.
     pub fn text(&self) -> String {
-        let (rows, columns) = self.size();
-        let mut out = String::new();
-        for row in 0..rows {
-            let mut line = String::new();
-            for column in 0..columns {
-                if let Some(cell) = self.parser.screen().cell(row, column) {
-                    line.push_str(&cell.contents());
-                }
-            }
-            out.push_str(line.trim_end());
-            if row + 1 < rows {
-                out.push('\n');
-            }
-        }
-        out
+        self.vt
+            .view()
+            .map(|line| line.text().trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Whether the application asked for cursor keys in application mode.
+    pub fn application_cursor(&self) -> bool {
+        self.vt.cursor_key_app_mode()
     }
 
     pub fn render(&mut self) {
-        let screen = self.parser.screen();
-        let (rows, columns) = screen.size();
+        let (columns, rows) = {
+            let (columns, rows) = self.vt.size();
+            (columns as u16, rows as u16)
+        };
 
+        let mut painted: Vec<(String, Vec<Run>)> = Vec::with_capacity(rows as usize);
         for row in 0..rows as usize {
-            let (signature, runs) = row_runs(screen, row as u16, columns, self.cell_w);
+            let Some(line) = self.vt.view().nth(row) else {
+                continue;
+            };
+            painted.push(row_runs(line, columns, self.cell_w));
+        }
+
+        for (row, (signature, runs)) in painted.into_iter().enumerate() {
             if self.painted.get(row) == Some(&signature) {
                 continue;
             }
-            if let Some(element) = self.rows.get(row) {
-                while let Some(child) = element.first_child() {
-                    element.remove_child(&child).ok();
-                }
-                for run in runs {
-                    let span: HtmlElement = platform::document()
-                        .create_element("span")
-                        .expect("span")
-                        .unchecked_into();
-                    if !run.css.is_empty() {
-                        span.set_attribute("style", &run.css).ok();
-                    }
-                    span.set_text_content(Some(&run.text));
-                    element.append_child(&span).ok();
-                }
-                if self.painted.len() <= row {
-                    self.painted.resize(row + 1, String::new());
-                }
-                self.painted[row] = signature;
+            let Some(element) = self.rows.get(row) else {
+                continue;
+            };
+            while let Some(child) = element.first_child() {
+                element.remove_child(&child).ok();
             }
+            for run in runs {
+                let span: HtmlElement = platform::document()
+                    .create_element("span")
+                    .expect("span")
+                    .unchecked_into();
+                if !run.css.is_empty() {
+                    span.set_attribute("style", &run.css).ok();
+                }
+                span.set_text_content(Some(&run.text));
+                element.append_child(&span).ok();
+            }
+            if self.painted.len() <= row {
+                self.painted.resize(row + 1, String::new());
+            }
+            self.painted[row] = signature;
         }
 
-        // Cursor.
-        // vt100 leaves the column at `width` after a line fills the row exactly:
-        // its pending-wrap state. A real terminal keeps the cursor block on the
-        // last cell until the next character arrives, so clamp rather than draw
-        // one cell past the grid (where it is clipped away or lands outside).
-        let (rows, columns) = screen.size();
-        let (mut row, mut column) = screen.cursor_position();
-        if column >= columns {
-            column = columns.saturating_sub(1);
+        // Cursor. `col == columns` means the line exactly fills the row and the
+        // next character will wrap; a real terminal keeps the block on the last
+        // cell until then, so clamp instead of drawing past the grid.
+        let mut cursor_row = self.vt.cursor().row;
+        let mut cursor_column = self.vt.cursor().col;
+        if cursor_column >= columns as usize {
+            cursor_column = (columns as usize).saturating_sub(1);
         }
-        if row >= rows {
-            row = rows.saturating_sub(1);
+        if cursor_row >= rows as usize {
+            cursor_row = (rows as usize).saturating_sub(1);
         }
+        self.cursor_visible = self.vt.cursor().visible;
 
-        self.cursor_visible = !screen.hide_cursor();
-        let x = column as f64 * self.cell_w;
-        let y = row as f64 * self.cell_h;
+        let x = cursor_column as f64 * self.cell_w;
+        let y = cursor_row as f64 * self.cell_h;
         self.cursor
             .style()
             .set_property("transform", &format!("translate({x}px, {y}px)"))
@@ -261,26 +314,9 @@ impl Terminal {
                 },
             )
             .ok();
-
-        let title = screen.title().to_owned();
-        if title != self.title {
-            let label = if title.is_empty() {
-                "pigeons-web".to_owned()
-            } else {
-                format!("{title} — pigeons-web")
-            };
-            self.title = title;
-            platform::document().set_title(&label);
-        }
-    }
-
-    /// Whether the alternate screen is active, i.e. a full-screen program runs.
-    pub fn alternate_screen(&self) -> bool {
-        self.parser.screen().alternate_screen()
     }
 }
 
-/// Builds one row's style runs plus a signature for change detection.
 /// One painted stretch of a row.
 struct Run {
     css: String,
@@ -289,43 +325,27 @@ struct Run {
 
 /// Builds one row's runs plus a signature for change detection.
 ///
-/// Wide glyphs (CJK, emoji) get their own fixed-width box. Left to itself, the
-/// text engine lays a fallback CJK glyph out at one em instead of two cells
-/// (13px against a 15.6px cell here), so a line containing them drifts left by
-/// ~2.6px per glyph and nothing below it lines up. Pinning the advance to two
-/// cells keeps the grid intact whatever font the system picks.
-fn row_runs(screen: &vt100::Screen, row: u16, columns: u16, cell_width: f64) -> (String, Vec<Run>) {
+/// Wide glyphs get their own fixed-width box. Left to itself, the text engine
+/// lays a fallback CJK glyph out at one em instead of two cells (13px against a
+/// 15.6px cell here), so a line containing them drifts left by ~2.6px per glyph
+/// and nothing below it lines up. Pinning the advance to the emulator's column
+/// count keeps the grid intact whatever font the system picks.
+fn row_runs(line: &avt::Line, columns: u16, cell_width: f64) -> (String, Vec<Run>) {
     let mut signature = String::with_capacity(columns as usize * 4);
     let mut runs: Vec<Run> = Vec::new();
 
-    for column in 0..columns {
-        let Some(cell) = screen.cell(row, column) else {
-            continue;
-        };
-        if cell.is_wide_continuation() {
+    for cell in line.cells() {
+        // The second half of a wide glyph is reported with width 0.
+        if cell.width() == 0 {
             continue;
         }
         let style = cell_style(cell);
-        let text = if cell.has_contents() {
-            cell.contents()
-        } else {
-            " ".to_owned()
-        };
+        let text = cell.char().to_string();
 
-        // Any non-ASCII glyph can be laid out at a width that disagrees with the
-        // cell model: a CJK ideograph comes out at one em (1.67 cells here) and
-        // an emoji that the emulator counts as one column can be drawn two cells
-        // wide. Boxing them makes the advance exact, whatever the font does;
-        // ASCII runs stay merged so ordinary output is unaffected.
-        let exotic = match text.chars().collect::<Vec<_>>().as_slice() {
-            [single] => !single.is_ascii(),
-            _ => false,
-        };
-        if exotic {
-            let cells = if cell.is_wide() { 2.0 } else { 1.0 };
-            let width = cell_width * cells;
+        if cell.width() > 1 || !cell.char().is_ascii() {
+            let boxed = cell_width * f64::from(cell.width());
             runs.push(Run {
-                css: format!("{style}display:inline-block;width:{width}px;text-align:center;"),
+                css: format!("{style}display:inline-block;width:{boxed}px;text-align:center;"),
                 text,
             });
             continue;
@@ -346,15 +366,16 @@ fn row_runs(screen: &vt100::Screen, row: u16, columns: u16, cell_width: f64) -> 
     (signature, runs)
 }
 
-fn cell_style(cell: &vt100::Cell) -> String {
-    let mut foreground = color_css(cell.fgcolor(), cell.bold());
-    let mut background = color_css(cell.bgcolor(), false);
-    if cell.inverse() {
+fn cell_style(cell: &avt::Cell) -> String {
+    let pen = cell.pen();
+    let mut foreground = color_css(pen.foreground(), pen.is_bold());
+    let mut background = color_css(pen.background(), false);
+    if pen.is_inverse() {
         // Swapping needs both sides resolved to concrete colors.
         let fg = foreground.unwrap_or_else(|| "#cfd3dc".to_owned());
         let bg = background.unwrap_or_else(|| "#10121a".to_owned());
-        foreground = Some(bg.to_owned());
-        background = Some(fg.to_owned());
+        foreground = Some(bg);
+        background = Some(fg);
     }
 
     let mut style = String::new();
@@ -368,22 +389,27 @@ fn cell_style(cell: &vt100::Cell) -> String {
         style.push_str(&color);
         style.push(';');
     }
-    if cell.bold() {
+    if pen.is_bold() {
         style.push_str("font-weight:600;");
     }
-    if cell.italic() {
+    if pen.is_faint() {
+        style.push_str("opacity:0.65;");
+    }
+    if pen.is_italic() {
         style.push_str("font-style:italic;");
     }
-    if cell.underline() {
+    if pen.is_underline() {
         style.push_str("text-decoration:underline;");
+    }
+    if pen.is_strikethrough() {
+        style.push_str("text-decoration:line-through;");
     }
     style
 }
 
-fn color_css(color: vt100::Color, bold: bool) -> Option<String> {
-    match color {
-        vt100::Color::Default => None,
-        vt100::Color::Idx(index) => {
+fn color_css(color: Option<AvtColor>, bold: bool) -> Option<String> {
+    match color? {
+        AvtColor::Indexed(index) => {
             let index = if bold && index < 8 { index + 8 } else { index };
             Some(match index {
                 0..=15 => ANSI[index as usize].to_owned(),
@@ -400,7 +426,7 @@ fn color_css(color: vt100::Color, bold: bool) -> Option<String> {
                 }
             })
         }
-        vt100::Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
+        AvtColor::RGB(rgb) => Some(format!("#{:02x}{:02x}{:02x}", rgb.r, rgb.g, rgb.b)),
     }
 }
 
@@ -422,10 +448,26 @@ fn measure_cell() -> (f64, f64) {
     (width, height)
 }
 
+/// Adds a carriage return before every line feed that lacks one.
+fn normalise_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 16);
+    let mut previous = 0u8;
+    for &byte in bytes {
+        if byte == b'\n' && previous != b'\r' {
+            out.push(b'\r');
+        }
+        out.push(byte);
+        previous = byte;
+    }
+    out
+}
+
 /// Translates a key event into the bytes a terminal would send.
 ///
-/// Returns `None` for keys the browser should keep, such as copy and paste
-/// shortcuts or pure modifier presses.
+/// Returns `None` for keys the browser should keep, for copy and paste
+/// shortcuts, and for plain text — printable characters arrive through the
+/// textarea's input event, which is the only path that also works for soft
+/// keyboards and IME composition.
 pub fn encode_key(event: &KeyboardEvent, application_cursor: bool) -> Option<Vec<u8>> {
     let key = event.key();
     let ctrl = event.ctrl_key();
@@ -504,9 +546,6 @@ pub fn encode_key(event: &KeyboardEvent, application_cursor: bool) -> Option<Vec
                 bytes.extend_from_slice(key.as_bytes());
                 bytes
             } else {
-                // Plain text is not sent from here: it goes through the
-                // textarea's input event, which is the only path that also
-                // works for soft keyboards and IME composition.
                 return None;
             }
         }
@@ -525,88 +564,14 @@ pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
-/// Adds a carriage return before every line feed that lacks one.
-fn normalise_newlines(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len() + 16);
-    let mut previous = 0u8;
-    for &byte in bytes {
-        if byte == b'\n' && previous != b'\r' {
-            out.push(b'\r');
-        }
-        out.push(byte);
-        previous = byte;
-    }
-    out
-}
-
-impl Terminal {
-    /// The cursor cell the emulator currently reports, for diagnostics.
-    pub fn cursor_cell(&self) -> (u16, u16) {
-        self.parser.screen().cursor_position()
-    }
-}
-
-/// Length of a trailing, incomplete escape prefix (`ESC` or `ESC [`).
-fn escape_prefix_len(data: &[u8]) -> usize {
-    match data {
-        [.., 0x1b] => 1,
-        [.., 0x1b, b'['] => 2,
-        _ => 0,
-    }
-}
-
-/// Rewrites `CSI s` / `CSI u` into `DECSC` / `DECRC`.
-///
-/// Both spellings mean "save cursor" / "restore cursor" in xterm, and prompts
-/// that draw a right-hand segment rely on it. The emulator implements only the
-/// ESC 7 / ESC 8 form, so the xterm spelling is silently ignored: the cursor is
-/// left wherever the segment ended instead of being restored, which then puts
-/// the prompt and the cursor on the wrong cells.
-fn rewrite_save_restore(data: &[u8]) -> Vec<u8> {
-    if !data.windows(3).any(|w| w == b"\x1b[s" || w == b"\x1b[u") {
-        return data.to_vec();
-    }
-    let mut out = Vec::with_capacity(data.len());
-    let mut index = 0;
-    while index < data.len() {
-        if data.len() - index >= 3
-            && data[index] == 0x1b
-            && data[index + 1] == b'['
-            && (data[index + 2] == b's' || data[index + 2] == b'u')
-        {
-            out.push(0x1b);
-            out.push(if data[index + 2] == b's' { b'7' } else { b'8' });
-            index += 3;
-        } else {
-            out.push(data[index]);
-            index += 1;
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{escape_prefix_len, rewrite_save_restore};
+    use super::normalise_newlines;
 
     #[test]
-    fn save_restore_is_rewritten_to_decsc_decrc() {
-        assert_eq!(rewrite_save_restore(b"a\x1b[sb\x1b[uc"), b"a\x1b7b\x1b8c");
-    }
-
-    #[test]
-    fn other_sequences_are_left_alone() {
-        // CSI with a parameter is not the save/restore spelling.
-        assert_eq!(rewrite_save_restore(b"\x1b[1s"), b"\x1b[1s");
-        assert_eq!(rewrite_save_restore(b"\x1b[2J"), b"\x1b[2J");
-        assert_eq!(rewrite_save_restore(b"plain text"), b"plain text");
-    }
-
-    #[test]
-    fn a_partial_prefix_is_detected_at_the_end_only() {
-        assert_eq!(escape_prefix_len(b"text\x1b"), 1);
-        assert_eq!(escape_prefix_len(b"text\x1b["), 2);
-        assert_eq!(escape_prefix_len(b"text\x1b[3"), 0);
-        assert_eq!(escape_prefix_len(b""), 0);
+    fn newline_translation_adds_only_missing_carriage_returns() {
+        assert_eq!(normalise_newlines(b"a\nb"), b"a\r\nb");
+        assert_eq!(normalise_newlines(b"a\r\nb"), b"a\r\nb");
+        assert_eq!(normalise_newlines(b"a\rb"), b"a\rb");
     }
 }

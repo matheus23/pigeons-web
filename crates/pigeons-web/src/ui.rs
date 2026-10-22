@@ -54,6 +54,7 @@ pub async fn run() -> Result<()> {
     }
     wire(&app);
     app.borrow_mut().relayout();
+    keyboard().focus().ok();
     update_chrome(&app);
     Ok(())
 }
@@ -298,7 +299,7 @@ impl App {
         }
 
         if self.session.is_some() {
-            if let Some(mut bytes) = terminal::encode_key(&event, self.term.alternate_screen()) {
+            if let Some(mut bytes) = terminal::encode_key(&event, self.term.application_cursor()) {
                 event.prevent_default();
                 if let Some(session) = &self.session {
                     if !session.pty {
@@ -920,7 +921,7 @@ fn render_chrome(label: Option<&str>, busy: bool) {
     let hint: HtmlElement = platform::by_id("hint");
 
     // Shortcut hints are meaningless on a phone, and they wrap badly in a
-    // narrow status bar.
+    // narrow status bar, so narrow layouts get no hint at all.
     let narrow = platform::window()
         .inner_width()
         .unwrap_or_default()
@@ -934,7 +935,7 @@ fn render_chrome(label: Option<&str>, busy: bool) {
             platform::set_text(
                 &hint,
                 if narrow {
-                    "tap the terminal to type"
+                    ""
                 } else {
                     "Ctrl+Shift+D disconnects · Ctrl+Shift+C copies"
                 },
@@ -946,7 +947,7 @@ fn render_chrome(label: Option<&str>, busy: bool) {
             platform::set_text(
                 &hint,
                 if narrow {
-                    "tap to type · settings for hosts"
+                    ""
                 } else {
                     "ssh <host> to connect · Ctrl+Shift+` for settings"
                 },
@@ -963,6 +964,7 @@ fn is_settings_open() -> bool {
 
 fn close_settings() {
     platform::by_id::<HtmlElement>("settings").set_class_name("modal");
+    keyboard().focus().ok();
 }
 
 fn open_settings(app: &Rc<RefCell<App>>) {

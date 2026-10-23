@@ -152,7 +152,11 @@ fn wire(app: &Rc<RefCell<App>>) {
     });
 
     platform::on::<web_sys::MouseEvent>(&surface, "mousedown", move |event| {
-        // Focus belongs to the input sink, not to whatever was tapped.
+        // A tap is followed by compatibility mouse events, and this one's default
+        // action moves focus to the body — which blurs the input and closes the
+        // soft keyboard the instant it opened. Suppressing the pointerdown
+        // instead would stop those compatibility events being generated at all;
+        // cancelling this single default is the narrow fix.
         event.prevent_default();
     });
 

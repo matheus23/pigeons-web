@@ -327,8 +327,19 @@ impl Terminal {
         self.scroll = 0;
     }
 
-    /// Forgets the modes a session set, without touching the screen.
+    /// Returns the terminal to the state a fresh session starts in.
+    ///
+    /// A session that dies inside a full-screen program leaves the emulator on
+    /// the alternate screen even though the page has forgotten the modes, so the
+    /// exit is fed too: that restores the shell output underneath instead of
+    /// writing the next prompt into the program's screen.
     pub fn reset_input_modes(&mut self) {
+        if self.modes.alternate_screen {
+            let exit = self.modes.alternate_exit;
+            self.process(exit);
+            // A program may have hidden the cursor on its way out.
+            self.process(b"\x1b[?25h");
+        }
         self.modes = Modes::initial();
         self.mode_tail.clear();
     }
@@ -359,13 +370,26 @@ impl Terminal {
         if self.scroll > furthest {
             self.scroll = furthest;
         }
-        self.sync_scroller(total, window);
+        self.sync_scroller(total);
         self.paint(columns, rows, total);
+    }
+
+    /// The furthest the viewport can scroll: the content that overflows it.
+    ///
+    /// Not (total - rows) * cell_h: fitting a whole number of rows leaves a
+    /// remainder of up to one cell, so the browser's maximum is that much less.
+    /// Taking the bottom to be the larger number made the view look one line back
+    /// at the true bottom — badge shown, cursor hidden, and output no longer
+    /// followed.
+    fn max_scroll(&self) -> f64 {
+        let height = self.viewport.scroll_height() as f64;
+        let client = self.viewport.client_height() as f64;
+        (height - client).max(0.0)
     }
 
     /// Sizes the scroll extent to the history and puts the view where `scroll`
     /// says, without touching a scroll position the browser already agrees with.
-    fn sync_scroller(&mut self, total: usize, window: usize) {
+    fn sync_scroller(&mut self, total: usize) {
         let height = total as f64 * self.cell_h;
         if (self.scroller_height - height).abs() > 0.5 {
             self.scroller
@@ -382,8 +406,7 @@ impl Terminal {
         } else {
             "viewport"
         });
-        let furthest = total.saturating_sub(window) as f64;
-        let top = (furthest - self.scroll as f64) * self.cell_h;
+        let top = self.max_scroll() - self.scroll as f64 * self.cell_h;
         if (self.viewport.scroll_top() as f64 - top).abs() > 0.5 {
             self.viewport.set_scroll_top(top.max(0.0) as i32);
         }
@@ -403,7 +426,7 @@ impl Terminal {
         let window = rows as usize;
         let furthest = total.saturating_sub(window) as f64;
         let top = self.viewport.scroll_top() as f64;
-        let back = ((furthest * self.cell_h - top) / self.cell_h).round();
+        let back = ((self.max_scroll() - top) / self.cell_h).round();
         let back = back.clamp(0.0, furthest) as usize;
         if back == self.scroll {
             return;
@@ -662,6 +685,8 @@ fn measure_cell() -> (f64, f64) {
 struct Modes {
     bracketed_paste: bool,
     alternate_screen: bool,
+    /// The leave sequence matching the way the alternate screen was entered.
+    alternate_exit: &'static [u8],
     alternate_scroll: bool,
     mouse_tracking: bool,
     sgr_mouse: bool,
@@ -672,6 +697,7 @@ impl Modes {
         Self {
             bracketed_paste: false,
             alternate_screen: false,
+            alternate_exit: b"\x1b[?1049l",
             // On by default: that is what makes a pager scrollable on a phone,
             // and a program that wants the wheel for itself turns it off.
             alternate_scroll: true,
@@ -684,7 +710,18 @@ impl Modes {
 /// Applies one private mode, returning whether the page tracks it.
 fn apply_mode(modes: &mut Modes, parameter: &str, enable: bool) -> bool {
     match parameter {
-        "47" | "1047" | "1049" => modes.alternate_screen = enable,
+        "47" => {
+            modes.alternate_screen = enable;
+            modes.alternate_exit = b"\x1b[?47l";
+        }
+        "1047" => {
+            modes.alternate_screen = enable;
+            modes.alternate_exit = b"\x1b[?1047l";
+        }
+        "1049" => {
+            modes.alternate_screen = enable;
+            modes.alternate_exit = b"\x1b[?1049l";
+        }
         "1000" | "1002" | "1003" => modes.mouse_tracking = enable,
         "1006" => modes.sgr_mouse = enable,
         "1007" => modes.alternate_scroll = enable,
@@ -709,6 +746,13 @@ fn scan_modes(modes: &mut Modes, tail: &mut Vec<u8>, data: &[u8]) -> bool {
     let mut index = 0;
 
     while index < buffer.len() {
+        // A chunk can end anywhere in the sequence, including after the bare
+        // escape. Anything that is a prefix of one has to survive to the next
+        // read, or the mode is silently lost.
+        let remaining = &buffer[index..];
+        if remaining.len() < 3 && [0x1b, b'[', b'?'].starts_with(remaining) {
+            break;
+        }
         let starts_mode = buffer[index] == 0x1b
             && buffer.get(index + 1) == Some(&b'[')
             && buffer.get(index + 2) == Some(&b'?');
@@ -904,7 +948,9 @@ pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Modes, control_code, encode_paste, normalise_newlines, scan_modes};
+    use super::{
+        Modes, control_code, encode_paste, normalise_newlines, pinned_advance, scan_modes,
+    };
 
     fn scan(data: &[u8]) -> (Modes, bool) {
         let mut modes = Modes::initial();
@@ -936,6 +982,29 @@ mod tests {
         assert!(!modes.bracketed_paste);
         scan_modes(&mut modes, &mut tail, b"04h");
         assert!(modes.bracketed_paste);
+    }
+
+    #[test]
+    fn a_sequence_cut_after_the_bare_escape_is_still_seen() {
+        // A chunk can end after ESC, after ESC [, or inside the parameters.
+        for split in 1..8 {
+            let sequence = b"\x1b[?1007l";
+            let mut modes = Modes::initial();
+            let mut tail = Vec::new();
+            scan_modes(&mut modes, &mut tail, &sequence[..split]);
+            scan_modes(&mut modes, &mut tail, &sequence[split..]);
+            assert!(!modes.alternate_scroll, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn the_alternate_exit_matches_the_entry() {
+        let (modes, _) = scan(b"\x1b[?47h");
+        assert_eq!(modes.alternate_exit, b"\x1b[?47l");
+        let (modes, _) = scan(b"\x1b[?1047h");
+        assert_eq!(modes.alternate_exit, b"\x1b[?1047l");
+        let (modes, _) = scan(b"\x1b[?1049h");
+        assert_eq!(modes.alternate_exit, b"\x1b[?1049l");
     }
 
     #[test]
@@ -1002,11 +1071,6 @@ mod tests {
         assert_eq!(control_code("ab"), None);
         assert_eq!(control_code("1"), None);
     }
-}
-
-#[cfg(test)]
-mod pinning_tests {
-    use super::pinned_advance;
 
     #[test]
     fn a_pinned_view_moves_with_the_lines_that_leave_it() {
